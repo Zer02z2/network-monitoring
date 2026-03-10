@@ -2,17 +2,18 @@
 """
 Network Traffic Sniffer
 
-Discovers destination IPs two ways:
-  1. TLS SNI  — filters tls.handshake.extensions_server_name for each name
-  2. DNS      — filters dns.qry.name for each name, extracts A/AAAA answers
+For each -names flag, one dedicated tshark discovery process runs:
+    tls.handshake.extensions_server_name contains "<name>"
+    OR dns.qry.name contains "<name>"
 
-Once an IP is added to known_ips, a single always-on traffic capture thread
-immediately starts reporting all TCP/UDP packets to/from that IP.
+Because each thread owns exactly one flag name, matched_names is always
+determined by which thread fired — no text-matching heuristics needed.
+
+One separate always-on traffic thread (bpf: tcp or udp) watches all packets
+and reports any whose src/dst IP is in known_ips.
 
 Usage:
     python sniffer.py -names openai.com chatgpt.com [-port 9000] [-interface en0]
-
-Clients connect to the TCP port and receive a stream of JSON objects, one per line.
 """
 
 import argparse
@@ -47,9 +48,11 @@ class Sniffer:
         self.broadcast_port = broadcast_port
         self.interface = interface
 
-        # Shared set — written by discovery thread, read by traffic thread.
-        # Python set reads/writes of references are GIL-safe for this use case.
+        # Shared structures — written by discovery threads, read by traffic thread.
+        # Plain dict/set mutations are GIL-safe for this use case.
         self.known_ips: set[str] = set()
+        # ip → list of flag names whose filter matched a packet to/from that ip
+        self.ip_to_names: dict[str, list[str]] = {}
 
         self._writers: list[asyncio.StreamWriter] = []
         self._writers_lock = asyncio.Lock()
@@ -67,10 +70,22 @@ class Sniffer:
         )
         addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
         print(f"[*] TCP broadcast server listening on {addrs}")
+        print(f"[*] Interface : {self.interface}")
 
-        # Two long-lived daemon threads — they never need to restart.
-        threading.Thread(target=self._discovery_capture_thread, daemon=True).start()
-        threading.Thread(target=self._traffic_capture_thread, daemon=True).start()
+        # One discovery thread per flag name + one shared traffic thread
+        for name in self.names:
+            threading.Thread(
+                target=self._discovery_thread,
+                args=(name,),
+                daemon=True,
+                name=f"discovery-{name}",
+            ).start()
+
+        threading.Thread(
+            target=self._traffic_capture_thread,
+            daemon=True,
+            name="traffic",
+        ).start()
 
         async with server:
             await server.serve_forever()
@@ -85,7 +100,7 @@ class Sniffer:
         async with self._writers_lock:
             self._writers.append(writer)
 
-        # Catch up: tell the new client about IPs we already know
+        # Send currently-known IPs to the newly connected client
         if self.known_ips:
             payload = json.dumps({
                 "type": "existing_ips",
@@ -99,7 +114,7 @@ class Sniffer:
                 pass
 
         try:
-            await reader.read(1)   # blocks until the client disconnects
+            await reader.read(1)  # blocks until the client disconnects
         except Exception:
             pass
         finally:
@@ -169,25 +184,17 @@ class Sniffer:
         return data
 
     # ------------------------------------------------------------------
-    # Thread 1 — Discovery (SNI + DNS)
-    # Runs forever; updates known_ips; broadcasts new_ip events.
+    # Per-flag discovery thread
+    # Each flag name gets its own tshark process with a dedicated filter.
+    # The flag_name is known at construction time — no text matching needed.
     # ------------------------------------------------------------------
 
-    def _build_discovery_filter(self) -> str:
-        sni_parts = [
-            f'tls.handshake.extensions_server_name contains "{name}"'
-            for name in self.names
-        ]
-        dns_parts = [
-            f'dns.qry.name contains "{name}"'
-            for name in self.names
-        ]
-        return " or ".join(sni_parts + dns_parts)
-
-    def _discovery_capture_thread(self):
-        disc_filter = self._build_discovery_filter()
-        print(f"[*] Discovery filter : {disc_filter}")
-        print(f"[*] Interface        : {self.interface}")
+    def _discovery_thread(self, flag_name: str):
+        disc_filter = (
+            f'tls.handshake.extensions_server_name contains "{flag_name}"'
+            f' or dns.qry.name contains "{flag_name}"'
+        )
+        print(f"[*] [{flag_name}] discovery filter: {disc_filter}")
 
         try:
             capture = pyshark.LiveCapture(
@@ -196,66 +203,95 @@ class Sniffer:
             )
             for packet in capture.sniff_continuously():
                 if hasattr(packet, "dns"):
-                    self._handle_dns_packet(packet)
+                    self._handle_dns_packet(packet, flag_name)
                 else:
-                    self._handle_sni_packet(packet)
+                    self._handle_sni_packet(packet, flag_name)
         except Exception as exc:
-            print(f"[!] Discovery capture error: {exc}")
+            print(f"[!] [{flag_name}] discovery error: {exc}")
 
-    def _handle_sni_packet(self, packet):
+    def _register_ip(self, ip: str, flag_name: str):
+        """Add ip to known_ips and record which flag triggered it.
+
+        An IP can legitimately be registered by multiple flags if the same
+        CDN endpoint serves several of the monitored domains. Merge rather
+        than overwrite so both attributions are visible.
+        """
+        self.known_ips.add(ip)
+        existing = self.ip_to_names.get(ip, [])
+        if flag_name not in existing:
+            self.ip_to_names[ip] = existing + [flag_name]
+
+    def _handle_sni_packet(self, packet, flag_name: str):
         ip_layer = (
-            packet.ip    if hasattr(packet, "ip")    else
-            packet.ipv6  if hasattr(packet, "ipv6")  else None
+            packet.ip   if hasattr(packet, "ip")   else
+            packet.ipv6 if hasattr(packet, "ipv6") else None
         )
         if ip_layer is None:
             return
 
         dst_ip = ip_layer.dst
-        if dst_ip in self.known_ips:
-            return
+        is_new = dst_ip not in self.known_ips
+        self._register_ip(dst_ip, flag_name)
 
-        self.known_ips.add(dst_ip)
-        print(f"[+] New IP via SNI  : {dst_ip}")
+        if not is_new:
+            return  # already reported; skip duplicate broadcast
 
-        info = self._packet_info(packet, event_type="new_ip")
-        info["discovered_ip"] = dst_ip
-        info["discovery_source"] = "sni"
+        print(f"[+] [{flag_name}] new IP via SNI : {dst_ip}")
+
+        sni = ""
         try:
-            info["sni"] = packet.tls.handshake_extensions_server_name
+            sni = packet.tls.handshake_extensions_server_name
         except Exception:
             pass
+
+        info = self._packet_info(packet, event_type="new_ip")
+        info["discovered_ip"]   = dst_ip
+        info["discovery_source"] = "sni"
+        info["matched_names"]   = self.ip_to_names[dst_ip]
+        if sni:
+            info["sni"] = sni
         self._broadcast(info)
 
-    def _handle_dns_packet(self, packet):
+    def _handle_dns_packet(self, packet, flag_name: str):
         dns = packet.dns
+
+        # Only process responses
         try:
             if dns.flags_response != "1":
                 return
         except AttributeError:
             return
 
+        # Read dns.qry.name via _all_fields to avoid the pyshark attribute-name
+        # mismatch (packet.dns.qry_name looks up "dns.qry_name" but the tshark
+        # field abbreviation is "dns.qry.name").
         query_name = ""
         try:
-            query_name = dns.qry_name
-        except AttributeError:
+            val = dns._all_fields.get("dns.qry.name", "")
+            query_name = str(val[0] if isinstance(val, list) else val).strip()
+        except Exception:
             pass
 
         for ip in self._extract_dns_ips(dns):
-            if ip in self.known_ips:
-                continue
-            self.known_ips.add(ip)
-            print(f"[+] New IP via DNS  : {ip}  (query: {query_name})")
+            is_new = ip not in self.known_ips
+            self._register_ip(ip, flag_name)
+
+            if not is_new:
+                continue  # already reported
+
+            print(f"[+] [{flag_name}] new IP via DNS : {ip}  (query: {query_name})")
 
             info = self._packet_info(packet, event_type="new_ip")
-            info["discovered_ip"] = ip
+            info["discovered_ip"]    = ip
             info["discovery_source"] = "dns"
-            info["dns_query"] = query_name
+            info["dns_query"]        = query_name
+            info["matched_names"]    = self.ip_to_names[ip]
             self._broadcast(info)
 
     @staticmethod
     def _extract_dns_ips(dns_layer) -> list[str]:
+        """Return all A and AAAA record values from a DNS layer."""
         ips: list[str] = []
-        # Preferred: _all_fields gives every repeated A/AAAA value
         try:
             for key, val in dns_layer._all_fields.items():
                 if key in ("dns.a", "dns.aaaa"):
@@ -278,21 +314,20 @@ class Sniffer:
         return ips
 
     # ------------------------------------------------------------------
-    # Thread 2 — Traffic monitor
-    # Single always-on capture; no restarts ever.
-    # Captures all TCP+UDP, then checks Python-side against known_ips.
-    # Handles both IPv4 and IPv6 transparently.
+    # Traffic monitor — single always-on capture
+    # Uses a broad BPF filter; checks Python-side against known_ips.
+    # No restarts needed: as known_ips grows the check automatically covers
+    # new IPs without touching the capture.
     # ------------------------------------------------------------------
 
     def _traffic_capture_thread(self):
-        print(f"[*] Traffic capture  : bpf=tcp or udp  interface={self.interface}")
+        print(f"[*] Traffic capture  : bpf=tcp or udp")
         try:
             capture = pyshark.LiveCapture(
                 interface=self.interface,
                 bpf_filter="tcp or udp",
             )
             for packet in capture.sniff_continuously():
-                # Resolve IP layer (handles both IPv4 and IPv6)
                 src_ip = dst_ip = None
                 if hasattr(packet, "ip"):
                     src_ip = packet.ip.src
@@ -301,8 +336,16 @@ class Sniffer:
                     src_ip = packet.ipv6.src
                     dst_ip = packet.ipv6.dst
 
-                if src_ip in self.known_ips or dst_ip in self.known_ips:
-                    self._broadcast(self._packet_info(packet, event_type="traffic"))
+                # Prefer dst for attribution; fall back to src (return traffic)
+                matched_ip = (
+                    dst_ip if dst_ip in self.known_ips else
+                    src_ip if src_ip in self.known_ips else
+                    None
+                )
+                if matched_ip is not None:
+                    info = self._packet_info(packet, event_type="traffic")
+                    info["matched_names"] = self.ip_to_names.get(matched_ip, [])
+                    self._broadcast(info)
 
         except Exception as exc:
             print(f"[!] Traffic capture error: {exc}")

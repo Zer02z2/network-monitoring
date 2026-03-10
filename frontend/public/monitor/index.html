@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Network Monitor</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<header>
+  <div class="status-dot" id="dot"></div>
+  <h1>Network Monitor</h1>
+  <div class="stat-chips">
+    <div class="chip">Packets <span id="stat-total">0</span></div>
+    <div class="chip">New IPs <span id="stat-ips">0</span></div>
+    <div class="chip">Shown <span id="stat-shown">0</span> / 500</div>
+  </div>
+</header>
+
+<div id="ip-bar">
+  <span class="label">Tracked IPs:</span>
+  <span id="ip-tags" style="display:contents"></span>
+  <span id="ip-none" style="color:var(--muted);font-size:11px">none yet</span>
+</div>
+
+<div id="table-wrapper">
+  <table>
+    <thead>
+      <tr>
+        <th>Type</th>
+        <th>Time</th>
+        <th>Transport</th>
+        <th>Protocol</th>
+        <th>Source</th>
+        <th>Destination</th>
+        <th>Bytes</th>
+        <th>Triggered by</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+</div>
+
+<footer>
+  <span id="footer-status">Connecting to server…</span>
+  <span>Max 500 entries (oldest removed automatically)</span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

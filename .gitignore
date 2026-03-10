@@ -1,0 +1,18 @@
+# Python virtualenv
+sniffer/venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Node dependencies
+frontend/node_modules/
+frontend/package-lock.json
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
