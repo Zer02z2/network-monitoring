@@ -8,6 +8,7 @@ const FLASH_THRESHOLD   = 300  // bytes — minimum size to trigger white flash 
 const FLASH_BURST_BYTES = 100  // bytes per burst (decoupled from BYTES_PER_GRID)
 const FLASH_SCALE_BYTES = 200  // bytes per interval — each interval adds 1 flash grid
 const FLASH_ROUND_DELAY = 10   // ms — gap between bursts
+const FLASH_QUEUE_CAP   = 100  // max total entries in flash queue at any time
 const FLASH_DURATION    = 50   // ms — how long a grid stays white
 const CYAN_CHANCE       = 0.15 // 0–1 — probability a new grid is cyan vs pink
 
@@ -162,11 +163,16 @@ class Packet {
     if (!pinkGrid._flashUntil) pinkGrid.draw()
   }
 
-  // Push burst entries into the global flash queue instead of using setTimeout
-  triggerFlashBursts(burstCount, getAllLitGrids, flashGrids) {
+  // Push burst entries into the global flash queue instead of using setTimeout.
+  // Each entry is tagged with this packet as owner so eviction can purge them.
+  // Stops pushing if the queue hits FLASH_QUEUE_CAP to prevent flooding.
+  triggerFlashBursts(burstCount, getAllLitGrids, flashGrids, flashRounds) {
     const now = performance.now()
     for (let b = 0; b < burstCount; b++) {
-      flashQueue.push({ at: now + b * FLASH_ROUND_DELAY, getAllLitGrids, flashGrids })
+      for (let r = 0; r < flashRounds; r++) {
+        if (flashQueue.length >= FLASH_QUEUE_CAP) return
+        flashQueue.push({ at: now + (b * flashRounds + r) * FLASH_ROUND_DELAY, getAllLitGrids, flashGrids, owner: this })
+      }
     }
   }
 }
@@ -194,9 +200,10 @@ class PacketManager {
     p.start()
 
     if (bytes > FLASH_THRESHOLD) {
-      const burstCount = Math.floor((bytes - FLASH_THRESHOLD) / FLASH_BURST_BYTES)
-      const flashGrids = Math.max(1, Math.floor(bytes / FLASH_SCALE_BYTES))
-      p.triggerFlashBursts(burstCount, () => this._allLitGrids(), flashGrids)
+      const burstCount  = Math.floor((bytes - FLASH_THRESHOLD) / FLASH_BURST_BYTES)
+      const flashGrids  = Math.max(1, Math.floor(bytes / FLASH_SCALE_BYTES))
+      const flashRounds = Math.max(1, Math.floor(bytes / FLASH_SCALE_BYTES))
+      p.triggerFlashBursts(burstCount, () => this._allLitGrids(), flashGrids, flashRounds)
     }
   }
 
@@ -209,6 +216,9 @@ class PacketManager {
   _evictTop() {
     const top = this.packets.shift()
     top.stopTimers()
+    for (let i = flashQueue.length - 1; i >= 0; i--) {
+      if (flashQueue[i].owner === top) flashQueue.splice(i, 1)
+    }
 
     const freed     = top.rowCount
     for (const p of this.packets) p.rowStart -= freed
@@ -229,6 +239,9 @@ class PacketManager {
     const idx = this.packets.indexOf(packet)
     if (idx === -1) return
     this.packets.splice(idx, 1)
+    for (let i = flashQueue.length - 1; i >= 0; i--) {
+      if (flashQueue[i].owner === packet) flashQueue.splice(i, 1)
+    }
 
     const freed = packet.rowCount
     for (let i = idx; i < this.packets.length; i++) {
