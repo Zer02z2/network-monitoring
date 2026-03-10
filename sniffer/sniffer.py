@@ -13,7 +13,7 @@ One separate always-on traffic thread (bpf: tcp or udp) watches all packets
 and reports any whose src/dst IP is in known_ips.
 
 Usage:
-    python sniffer.py -names openai.com chatgpt.com [-port 9000] [-interface en0]
+    python sniffer.py -names openai.com chatgpt.com [-ip 127.0.0.1] [-port 9000] [-interface en0]
 """
 
 import argparse
@@ -32,6 +32,10 @@ def parse_args():
         help="Domain names to watch via TLS SNI and DNS (e.g. openai.com chatgpt.com)"
     )
     parser.add_argument(
+        "-ip", default="127.0.0.1",
+        help="IP or mDNS hostname to bind the broadcast server on (default: 127.0.0.1)"
+    )
+    parser.add_argument(
         "-port", type=int, default=9000,
         help="TCP port to stream JSON traffic on (default: 9000)"
     )
@@ -43,8 +47,9 @@ def parse_args():
 
 
 class Sniffer:
-    def __init__(self, names: list[str], broadcast_port: int, interface: str):
+    def __init__(self, names: list[str], broadcast_ip: str, broadcast_port: int, interface: str):
         self.names = names
+        self.broadcast_ip = broadcast_ip
         self.broadcast_port = broadcast_port
         self.interface = interface
 
@@ -66,7 +71,7 @@ class Sniffer:
         self._loop = asyncio.get_running_loop()
 
         server = await asyncio.start_server(
-            self._handle_client, "0.0.0.0", self.broadcast_port
+            self._handle_client, self.broadcast_ip, self.broadcast_port
         )
         addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
         print(f"[*] TCP broadcast server listening on {addrs}")
@@ -368,6 +373,7 @@ def main():
     print(f"[*] Watching (SNI + DNS): {', '.join(args.names)}")
     sniffer = Sniffer(
         names=args.names,
+        broadcast_ip=args.ip,
         broadcast_port=args.port,
         interface=args.interface,
     )
