@@ -13,16 +13,28 @@ One separate always-on traffic thread (bpf: tcp or udp) watches all packets
 and reports any whose src/dst IP is in known_ips.
 
 Usage:
-    python sniffer.py -names openai.com chatgpt.com [-ip 127.0.0.1] [-port 9000] [-interface en0]
+    python sniffer.py -names openai.com chatgpt.com [-port 9000] [-interface en0]
 """
 
 import argparse
 import asyncio
 import json
+import socket
 import threading
+from collections import deque
 from datetime import datetime, timezone
 
 import pyshark
+
+
+def _get_local_ip() -> str:
+    """Find the machine's outbound LAN IP by probing a public address (no data sent)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
 
 
 def parse_args():
@@ -32,10 +44,6 @@ def parse_args():
         help="Domain names to watch via TLS SNI and DNS (e.g. openai.com chatgpt.com)"
     )
     parser.add_argument(
-        "-ip", default="127.0.0.1",
-        help="IP or mDNS hostname to bind the broadcast server on (default: 127.0.0.1)"
-    )
-    parser.add_argument(
         "-port", type=int, default=9000,
         help="TCP port to stream JSON traffic on (default: 9000)"
     )
@@ -43,21 +51,28 @@ def parse_args():
         "-interface", default="en0",
         help="Network interface to capture on (default: en0)"
     )
+    parser.add_argument(
+        "-send-interval", type=int, default=1, dest="send_interval",
+        help="ms between each queued event being sent to clients (default: 5)"
+    )
     return parser.parse_args()
 
 
 class Sniffer:
-    def __init__(self, names: list[str], broadcast_ip: str, broadcast_port: int, interface: str):
-        self.names = names
-        self.broadcast_ip = broadcast_ip
-        self.broadcast_port = broadcast_port
-        self.interface = interface
+    def __init__(self, names: list[str], broadcast_port: int, interface: str, send_interval: int):
+        self.names           = names
+        self.broadcast_port  = broadcast_port
+        self.interface       = interface
+        self._send_interval  = send_interval  # ms between sends
 
         # Shared structures — written by discovery threads, read by traffic thread.
         # Plain dict/set mutations are GIL-safe for this use case.
         self.known_ips: set[str] = set()
         # ip → list of flag names whose filter matched a packet to/from that ip
         self.ip_to_names: dict[str, list[str]] = {}
+
+        # Send queue — threads append, the asyncio drain loop pops
+        self._send_queue: deque = deque()
 
         self._writers: list[asyncio.StreamWriter] = []
         self._writers_lock = asyncio.Lock()
@@ -70,12 +85,20 @@ class Sniffer:
     async def start(self):
         self._loop = asyncio.get_running_loop()
 
+        lan_ip = _get_local_ip()
+        # Bind to both localhost and the LAN IP (deduplicated)
+        hosts  = list(dict.fromkeys(["127.0.0.1", lan_ip]))
+
         server = await asyncio.start_server(
-            self._handle_client, self.broadcast_ip, self.broadcast_port
+            self._handle_client, hosts, self.broadcast_port
         )
         addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
-        print(f"[*] TCP broadcast server listening on {addrs}")
+        print(f"[*] LAN IP    : {lan_ip}")
+        print(f"[*] Listening : {addrs}")
         print(f"[*] Interface : {self.interface}")
+        print(f"[*] Send interval: {self._send_interval} ms")
+
+        asyncio.create_task(self._drain_loop())
 
         # One discovery thread per flag name + one shared traffic thread
         for name in self.names:
@@ -135,11 +158,17 @@ class Sniffer:
                 pass
             print(f"[-] Client disconnected: {addr}")
 
+    async def _drain_loop(self):
+        """Asyncio task: sends one queued event every send_interval ms."""
+        interval = self._send_interval / 1000
+        while True:
+            await asyncio.sleep(interval)
+            if self._send_queue:
+                await self._async_broadcast(self._send_queue.popleft())
+
     def _broadcast(self, data: dict):
-        """Thread-safe: schedule a broadcast onto the asyncio event loop."""
-        if self._loop is None or not self._loop.is_running():
-            return
-        asyncio.run_coroutine_threadsafe(self._async_broadcast(data), self._loop)
+        """Thread-safe: push data onto the send queue. The drain loop delivers it."""
+        self._send_queue.append(data)
 
     async def _async_broadcast(self, data: dict):
         message = (json.dumps(data) + "\n").encode()
@@ -373,9 +402,9 @@ def main():
     print(f"[*] Watching (SNI + DNS): {', '.join(args.names)}")
     sniffer = Sniffer(
         names=args.names,
-        broadcast_ip=args.ip,
         broadcast_port=args.port,
         interface=args.interface,
+        send_interval=args.send_interval,
     )
     try:
         asyncio.run(sniffer.start())
