@@ -37,10 +37,10 @@ RECT_MAX_W_FRAC   = 700 / 1920   # ~0.3646
 RECT_MIN_H_FRAC   = 2   / 1080   # ~0.00185
 RECT_MAX_H_FRAC   = 200 / 1080   # ~0.185
 
-RECT_LIFETIME     = 650    # ms — base lifetime
+RECT_LIFETIME     = 100    # ms — base lifetime
 RECT_LIFETIME_VAR = 0.7    # randomness factor on lifetime
 RECT_ALPHA_MIN    = 0.22
-RECT_ALPHA_MAX    = 0.75
+RECT_ALPHA_MAX    = 1
 RED_CHANCE        = 0.78   # probability of neon red vs neon blue
 STROKE_CHANCE     = 0.22   # probability of outline-only rect
 
@@ -51,8 +51,8 @@ STREAM_PER_BYTE   = 0.00006
 
 FLASH_THRESHOLD   = 600    # bytes — triggers white flash rects
 FLASH_ALPHA_MIN   = 0.55
-FLASH_ALPHA_MAX   = 0.92
-FLASH_LIFETIME    = 260    # ms
+FLASH_ALPHA_MAX   = 1
+FLASH_LIFETIME    = 50    # ms — white flash is short and brutal
 FLASH_MAX_COUNT   = 3
 
 MAX_RECTS         = 350    # global cap — oldest pruned when exceeded
