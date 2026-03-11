@@ -56,7 +56,7 @@ class Framebuffer:
         self._pixels: dict[tuple[int, int], tuple[int, int, int]] = {}
         self._dirty:  set[tuple[int, int]] = set()
 
-    def set(self, col: int, row: int, color: tuple[int, int, int]):
+    def put(self, col: int, row: int, color: tuple[int, int, int]):
         if color == COLOR_BG:
             self._pixels.pop((col, row), None)
         else:
@@ -96,21 +96,21 @@ class Grid:
 
     def draw(self):
         if not self.cleared:
-            fb.set(self.col, self.abs_row, self.color)
+            fb.put(self.col, self.abs_row, self.color)
 
     # Locked: ignored if already flashing (flash_until > 0)
     def flash(self):
         if self.cleared or self.flash_until > 0:
             return
         self.flash_until = now_ms() + FLASH_DURATION
-        fb.set(self.col, self.abs_row, COLOR_WHITE)
+        fb.put(self.col, self.abs_row, COLOR_WHITE)
         self.packet.swap_one_color()
 
     # Fade wins: clears flash state immediately without waiting
     def erase(self):
         self.flash_until = 0
         self.cleared     = True
-        fb.set(self.col, self.abs_row, COLOR_BG)
+        fb.put(self.col, self.abs_row, COLOR_BG)
 
     def stop_flash(self):
         self.flash_until = 0
@@ -158,7 +158,7 @@ class Packet:
         for g in self.grids:
             if not g.cleared and g.flash_until > 0 and now >= g.flash_until:
                 g.flash_until = 0
-                fb.set(g.col, g.abs_row, g.color)
+                fb.put(g.col, g.abs_row, g.color)
 
         # Fade: erase one grid per DISAPPEAR_STEP after DISAPPEAR_DELAY
         if now < self._fade_start_at or now < self._next_erase_at:
@@ -257,11 +257,11 @@ class PacketManager:
         for p in self.packets[from_idx:]:
             for g in p.grids:
                 if not g.cleared:
-                    fb.set(g.col, g.abs_row, COLOR_BG)
+                    fb.put(g.col, g.abs_row, COLOR_BG)
             p.row_start -= freed
             for g in p.grids:
                 if not g.cleared:
-                    fb.set(g.col, g.abs_row, g.color)
+                    fb.put(g.col, g.abs_row, g.color)
         self.next_row_start -= freed
 
     def _evict_top(self):
