@@ -55,6 +55,7 @@ class Framebuffer:
     def __init__(self):
         self._pixels: dict[tuple[int, int], tuple[int, int, int]] = {}
         self._dirty:  set[tuple[int, int]] = set()
+        self.resolution = 1  # pixels per grid cell; set by main() before use
 
     def put(self, col: int, row: int, color: tuple[int, int, int]):
         if color == COLOR_BG:
@@ -63,12 +64,21 @@ class Framebuffer:
             self._pixels[(col, row)] = color
         self._dirty.add((col, row))
 
+    def _set_cell(self, canvas, col: int, row: int, r: int, g: int, b: int):
+        """Write one logical grid cell (resolution × resolution pixels) to canvas."""
+        res = self.resolution
+        px  = col * res
+        py  = row * res
+        for dy in range(res):
+            for dx in range(res):
+                canvas.SetPixel(px + dx, py + dy, r, g, b)
+
     def flush(self, canvas) -> set[tuple[int, int]]:
-        """Apply dirty pixels to canvas. Returns the set of coords flushed."""
+        """Apply dirty grid cells to canvas. Returns the set of coords flushed."""
         flushed = set(self._dirty)
         for (col, row) in flushed:
             r, g, b = self._pixels.get((col, row), COLOR_BG)
-            canvas.SetPixel(col, row, r, g, b)
+            self._set_cell(canvas, col, row, r, g, b)
         self._dirty.clear()
         return flushed
 
@@ -261,7 +271,8 @@ class PacketManager:
             p.row_start -= freed
             for g in p.grids:
                 if not g.cleared:
-                    fb.put(g.col, g.abs_row, g.color)
+                    # preserve white for mid-flash grids
+                    fb.put(g.col, g.abs_row, COLOR_WHITE if g.flash_until > 0 else g.color)
         self.next_row_start -= freed
 
     def _evict_top(self):
@@ -339,6 +350,10 @@ def parse_args():
     parser.add_argument("--led-hardware-mapping",     default="regular",      dest="led_hardware_mapping")
     parser.add_argument("--led-show-refresh",         action="store_true",    dest="led_show_refresh")
 
+    # Display scaling
+    parser.add_argument("--resolution", type=int, default=1, choices=range(1, 11),
+                        help="Pixels per grid cell 1–10 (default: 1)")
+
     return parser.parse_args()
 
 
@@ -361,9 +376,11 @@ def main():
     options.drop_privileges     = False
 
     matrix = RGBMatrix(options=options)
-    cols   = matrix.width   # cols × chain_length
-    rows   = matrix.height  # rows × parallel
-    print(f"[*] Matrix: {cols}×{rows} pixels")
+    res    = args.resolution
+    cols   = matrix.width  // res   # logical grid columns
+    rows   = matrix.height // res   # logical grid rows
+    fb.resolution = res
+    print(f"[*] Matrix: {matrix.width}×{matrix.height} pixels | resolution={res} | grid: {cols}×{rows}")
     print(f"[*] Connecting to sniffer at {args.ip}:{args.port}")
 
     manager  = PacketManager(cols=cols, rows=rows)
@@ -416,10 +433,10 @@ def main():
             # Swap — canvas is now displayed; returned canvas is the back buffer
             canvas = matrix.SwapOnVSync(canvas)
 
-            # Keep the back buffer in sync: apply the same pixels that just changed
+            # Keep the back buffer in sync: apply the same cells that just changed
             for (col, row) in flushed:
                 r, g, b = fb._pixels.get((col, row), COLOR_BG)
-                canvas.SetPixel(col, row, r, g, b)
+                fb._set_cell(canvas, col, row, r, g, b)
 
             # Sleep for remainder of frame budget
             elapsed = time.monotonic() - loop_start
