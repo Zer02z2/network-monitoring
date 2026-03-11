@@ -109,12 +109,13 @@ class Grid:
             fb.put(self.col, self.abs_row, self.color)
 
     # Locked: ignored if already flashing (flash_until > 0)
-    def flash(self):
+    def flash(self, swap: bool = True):
         if self.cleared or self.flash_until > 0:
             return
         self.flash_until = now_ms() + FLASH_DURATION
         fb.put(self.col, self.abs_row, COLOR_WHITE)
-        self.packet.swap_one_color()
+        if swap:
+            self.packet.swap_one_color()
 
     # Fade wins: clears flash state immediately without waiting
     def erase(self):
@@ -281,7 +282,7 @@ class PacketManager:
         self._purge_flash_queue(top)
         self._shift_packets_up(0, top.row_count)
         for g in self._all_lit_grids():
-            g.flash()
+            g.flash(swap=False)  # skip swap_one_color during eviction — too expensive under load
 
     def on_gone(self, packet: Packet):
         idx = self.packets.index(packet)
@@ -319,7 +320,10 @@ def tcp_client(host: str, port: int, incoming: queue.Queue):
                         try:
                             data = json.loads(line)
                             if data.get("type") in ("traffic", "new_ip"):
-                                incoming.put(data.get("length", 0))
+                                try:
+                                    incoming.put_nowait(data.get("length", 0))
+                                except queue.Full:
+                                    pass  # drop packet — main loop is behind, don't block TCP reader
                         except json.JSONDecodeError:
                             pass
         except Exception as e:
@@ -384,7 +388,7 @@ def main():
     print(f"[*] Connecting to sniffer at {args.ip}:{args.port}")
 
     manager  = PacketManager(cols=cols, rows=rows)
-    incoming: queue.Queue = queue.Queue()
+    incoming: queue.Queue = queue.Queue(maxsize=50)
 
     threading.Thread(
         target=tcp_client,
@@ -401,8 +405,8 @@ def main():
             loop_start = time.monotonic()
             now        = loop_start * 1000  # ms
 
-            # Drain incoming packets queued by the TCP thread
-            while not incoming.empty():
+            # Drain incoming packets — cap at 10 per frame to avoid frame stalls
+            for _ in range(10):
                 try:
                     manager.add(incoming.get_nowait())
                 except queue.Empty:
@@ -438,11 +442,7 @@ def main():
                 r, g, b = fb._pixels.get((col, row), COLOR_BG)
                 fb._set_cell(canvas, col, row, r, g, b)
 
-            # Sleep for remainder of frame budget
-            elapsed = time.monotonic() - loop_start
-            sleep   = frame_sec - elapsed
-            if sleep > 0:
-                time.sleep(sleep)
+            # SwapOnVSync already blocks until the next hardware vsync — no extra sleep needed
 
     except KeyboardInterrupt:
         matrix.Clear()
