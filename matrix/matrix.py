@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-RGB Matrix renderer for Network Traffic Monitor.
+RGB Matrix renderer — rect-based art matching frontend/public/art/app.js
 
-Listens for an incoming tunnel connection and renders the same art visualization
-as the browser canvas onto a physical RGB LED matrix.
+Listens for an incoming tunnel connection and renders neon rect bursts
+onto a physical RGB LED matrix. All rect dimensions are expressed as
+fractions of the display size so the art scales correctly to any matrix.
 
 Usage:
     sudo python3 matrix.py --port 9001 \
@@ -22,281 +23,180 @@ import socket
 import threading
 import time
 
+import numpy as np
 from rgbmatrix import RGBMatrix, RGBMatrixOptions
 
-# ── TUNABLE CONFIG ────────────────────────────────────────────────────────
-BYTES_PER_GRID    = 20    # bytes per grid cell (ceil)
-DISAPPEAR_DELAY   = 100   # ms — pause before a packet's cells start fading
-DISAPPEAR_STEP    = 5     # ms — time between each cell erasing
-FLASH_THRESHOLD   = 300   # bytes — minimum size to trigger white flash bursts
-FLASH_BURST_BYTES = 100   # bytes per burst (decoupled from BYTES_PER_GRID)
-FLASH_SCALE_BYTES = 200   # bytes per interval — adds 1 flash grid & round each
-FLASH_ROUND_DELAY = 10    # ms — gap between bursts
-FLASH_DURATION    = 50    # ms — how long a pixel stays white
-FLASH_QUEUE_CAP   = 100   # max entries in flash queue at any time
-CYAN_CHANCE       = 0.15  # probability a new grid is cyan vs pink
-TARGET_FPS        = 60
+# ── TUNABLE CONFIG ─────────────────────────────────────────────────────────
+RECT_BASE_COUNT   = 2
+RECT_SCALE        = 0.012
+RECT_MAX_COUNT    = 28
 
-COLOR_BG    = (0,   0,   0)
-COLOR_PINK  = (255, 45,  111)
-COLOR_CYAN  = (0,   255, 224)
-COLOR_WHITE = (255, 255, 255)
-# ─────────────────────────────────────────────────────────────────────────
+# Rect dimensions as fractions of the display — matches app.js on a 1920×1080 canvas
+RECT_MIN_W_FRAC   = 20  / 1920   # ~0.0104
+RECT_MAX_W_FRAC   = 700 / 1920   # ~0.3646
+RECT_MIN_H_FRAC   = 2   / 1080   # ~0.00185
+RECT_MAX_H_FRAC   = 200 / 1080   # ~0.185
+
+RECT_LIFETIME     = 650    # ms — base lifetime
+RECT_LIFETIME_VAR = 0.7    # randomness factor on lifetime
+RECT_ALPHA_MIN    = 0.22
+RECT_ALPHA_MAX    = 0.75
+RED_CHANCE        = 0.78   # probability of neon red vs neon blue
+STROKE_CHANCE     = 0.22   # probability of outline-only rect
+
+Y_SPREAD          = 0.28   # spread around stream Y as fraction of display height
+Y_RANDOM_CHANCE   = 0.12
+Y_OPPOSITE_CHANCE = 0.09
+STREAM_PER_BYTE   = 0.00006
+
+FLASH_THRESHOLD   = 600    # bytes — triggers white flash rects
+FLASH_ALPHA_MIN   = 0.55
+FLASH_ALPHA_MAX   = 0.92
+FLASH_LIFETIME    = 260    # ms
+FLASH_MAX_COUNT   = 3
+
+MAX_RECTS         = 350    # global cap — oldest pruned when exceeded
+TARGET_FPS        = 30     # conservative for Pi CPU budget
+
+NEON_RED   = (255,  15,  45)
+NEON_BLUE  = ( 20, 130, 255)
+NEON_WHITE = (255, 255, 255)
+# ──────────────────────────────────────────────────────────────────────────
 
 
 def now_ms() -> float:
     return time.monotonic() * 1000
 
 
-# ── Framebuffer ───────────────────────────────────────────────────────────
-# Tracks current pixel state so both hardware double-buffers stay in sync.
-# Only stores non-black pixels. Dirty set accumulates all changes each frame.
-class Framebuffer:
-    def __init__(self):
-        self._pixels: dict[tuple[int, int], tuple[int, int, int]] = {}
-        self._dirty:  set[tuple[int, int]] = set()
-        self.resolution = 1  # pixels per grid cell; set by main() before use
+# ── Global rect list and stream position ──────────────────────────────────
+_stream_y: float = 0.05
+_rects: list[dict] = []  # {x, y, w, h, rgb, alpha, created_at, die_at, stroke, is_flash}
 
-    def put(self, col: int, row: int, color: tuple[int, int, int]):
-        if color == COLOR_BG:
-            self._pixels.pop((col, row), None)
+
+def _pick_y(base_y: float, h: int, matrix_h: int) -> int:
+    r = random.random()
+    if r < Y_RANDOM_CHANCE:
+        return int(random.random() * max(0, matrix_h - h))
+    elif r < Y_RANDOM_CHANCE + Y_OPPOSITE_CHANCE:
+        center = matrix_h - base_y
+    else:
+        center = base_y
+    spread = Y_SPREAD * matrix_h
+    y = center + (random.random() + random.random() - 1) * spread
+    return int(max(0, min(matrix_h - h, y)))
+
+
+def spawn_burst(bytes_: int, matrix_w: int, matrix_h: int):
+    global _stream_y
+    base_y = _stream_y * matrix_h
+    count  = min(RECT_MAX_COUNT, RECT_BASE_COUNT + int(bytes_ * RECT_SCALE))
+    now    = now_ms()
+
+    rect_min_w = max(1, int(RECT_MIN_W_FRAC * matrix_w))
+    rect_max_w = max(rect_min_w + 1, int(RECT_MAX_W_FRAC * matrix_w))
+    rect_min_h = max(1, int(RECT_MIN_H_FRAC * matrix_h))
+    rect_max_h = max(rect_min_h + 1, int(RECT_MAX_H_FRAC * matrix_h))
+
+    for _ in range(count):
+        scale_w = min(1.0, bytes_ / 2000)
+        scale_h = min(1.0, bytes_ / 3000)
+        max_w   = rect_min_w + scale_w * (rect_max_w - rect_min_w)
+        max_h   = rect_min_h + scale_h * (rect_max_h - rect_min_h)
+        w = max(1, int(rect_min_w + random.random() * (max_w - rect_min_w)))
+        h = max(1, int(rect_min_h + random.random() * (max_h - rect_min_h)))
+        x = int(random.random() * max(0, matrix_w - w))
+        y = _pick_y(base_y, h, matrix_h)
+        rgb   = NEON_RED if random.random() < RED_CHANCE else NEON_BLUE
+        alpha = RECT_ALPHA_MIN + random.random() * (RECT_ALPHA_MAX - RECT_ALPHA_MIN)
+        life  = RECT_LIFETIME * (1 - RECT_LIFETIME_VAR * 0.5 + random.random() * RECT_LIFETIME_VAR)
+        _rects.append({
+            'x': x, 'y': y, 'w': w, 'h': h,
+            'rgb': rgb, 'alpha': alpha,
+            'created_at': now, 'die_at': now + life,
+            'stroke': random.random() < STROKE_CHANCE,
+            'is_flash': False,
+        })
+
+    if bytes_ >= FLASH_THRESHOLD:
+        intensity   = min(1.0, (bytes_ - FLASH_THRESHOLD) / 5000)
+        flash_count = 1 + int(intensity * (FLASH_MAX_COUNT - 1))
+        for _ in range(flash_count):
+            fw = int(matrix_w * (0.25 + random.random() * 0.70))
+            fh = int(matrix_h * (0.03 + intensity * 0.30 + random.random() * 0.12))
+            fw = max(1, min(matrix_w, fw))
+            fh = max(1, min(matrix_h, fh))
+            fx = int(random.random() * max(0, matrix_w - fw))
+            fy = _pick_y(base_y, fh, matrix_h)
+            fa = FLASH_ALPHA_MIN + intensity * (FLASH_ALPHA_MAX - FLASH_ALPHA_MIN) * random.random()
+            _rects.append({
+                'x': fx, 'y': fy, 'w': fw, 'h': fh,
+                'rgb': NEON_WHITE, 'alpha': fa,
+                'created_at': now,
+                'die_at': now + FLASH_LIFETIME * (0.6 + random.random() * 0.8),
+                'stroke': random.random() < 0.45,
+                'is_flash': True,
+            })
+
+    _stream_y = (_stream_y + bytes_ * STREAM_PER_BYTE) % 1.0
+
+    if len(_rects) > MAX_RECTS:
+        del _rects[:len(_rects) - MAX_RECTS]
+
+
+def render_frame(matrix_w: int, matrix_h: int, now: float) -> np.ndarray:
+    """
+    Composite all live rects oldest→newest onto a black canvas.
+    Alpha is applied as: pixel = pixel * (1-alpha) + color * alpha
+    which is correct because the background is black — identical to the JS canvas.
+    Returns a uint8 HxWx3 array.
+    """
+    frame = np.zeros((matrix_h, matrix_w, 3), dtype=np.float32)
+
+    i = 0
+    while i < len(_rects):
+        r = _rects[i]
+        if now >= r['die_at']:
+            _rects.pop(i)
+            continue
+
+        age      = now - r['created_at']
+        lifetime = r['die_at'] - r['created_at']
+
+        if r['is_flash']:
+            # Cosine ease — hits instantly, fades smoothly (matches JS)
+            t     = (age / lifetime) * math.pi * 0.5
+            alpha = r['alpha'] * math.cos(t) ** 2
         else:
-            self._pixels[(col, row)] = color
-        self._dirty.add((col, row))
+            # Hold alpha for first 15%, then linear fade to 0 (matches JS)
+            hold   = lifetime * 0.15
+            fade_t = 0.0 if age < hold else (age - hold) / (lifetime - hold)
+            alpha  = r['alpha'] * max(0.0, 1.0 - fade_t)
 
-    def _set_cell(self, canvas, col: int, row: int, r: int, g: int, b: int):
-        """Write one logical grid cell (resolution × resolution pixels) to canvas."""
-        res = self.resolution
-        px  = col * res
-        py  = row * res
-        for dy in range(res):
-            for dx in range(res):
-                canvas.SetPixel(px + dx, py + dy, r, g, b)
+        x1 = max(0, r['x'])
+        y1 = max(0, r['y'])
+        x2 = min(matrix_w, r['x'] + r['w'])
+        y2 = min(matrix_h, r['y'] + r['h'])
+        if x1 >= x2 or y1 >= y2:
+            i += 1
+            continue
 
-    def flush(self, canvas) -> set[tuple[int, int]]:
-        """Apply dirty grid cells to canvas. Returns the set of coords flushed."""
-        flushed = set(self._dirty)
-        for (col, row) in flushed:
-            r, g, b = self._pixels.get((col, row), COLOR_BG)
-            self._set_cell(canvas, col, row, r, g, b)
-        self._dirty.clear()
-        return flushed
+        color = np.array(r['rgb'], dtype=np.float32)
 
-    def clear(self):
-        self._pixels.clear()
-        self._dirty.clear()
+        if r['stroke']:
+            # Draw only the border of the rect
+            frame[y1,   x1:x2] = frame[y1,   x1:x2] * (1 - alpha) + color * alpha
+            if y2 - 1 != y1:
+                frame[y2-1, x1:x2] = frame[y2-1, x1:x2] * (1 - alpha) + color * alpha
+            if y2 - y1 > 2:
+                frame[y1+1:y2-1, x1]   = frame[y1+1:y2-1, x1]   * (1 - alpha) + color * alpha
+                if x2 - 1 != x1:
+                    frame[y1+1:y2-1, x2-1] = frame[y1+1:y2-1, x2-1] * (1 - alpha) + color * alpha
+        else:
+            frame[y1:y2, x1:x2] = frame[y1:y2, x1:x2] * (1 - alpha) + color * alpha
 
+        i += 1
 
-fb = Framebuffer()
-
-
-# ── Grid ──────────────────────────────────────────────────────────────────
-class Grid:
-    def __init__(self, col: int, rel_row: int, color: tuple, packet):
-        self.col         = col
-        self.rel_row     = rel_row
-        self.color       = color   # mutable — swap_one_color changes this live
-        self.packet      = packet  # back-ref so abs_row is always current
-        self.cleared     = False
-        self.flash_until = 0.0    # ms timestamp; 0 = not flashing
-
-    @property
-    def abs_row(self) -> int:
-        return self.packet.row_start + self.rel_row
-
-    def draw(self):
-        if not self.cleared:
-            fb.put(self.col, self.abs_row, self.color)
-
-    # Locked: ignored if already flashing (flash_until > 0)
-    def flash(self, swap: bool = True):
-        if self.cleared or self.flash_until > 0:
-            return
-        self.flash_until = now_ms() + FLASH_DURATION
-        fb.put(self.col, self.abs_row, COLOR_WHITE)
-        if swap:
-            self.packet.swap_one_color()
-
-    # Fade wins: clears flash state immediately without waiting
-    def erase(self):
-        self.flash_until = 0
-        self.cleared     = True
-        fb.put(self.col, self.abs_row, COLOR_BG)
-
-    def stop_flash(self):
-        self.flash_until = 0
-
-
-# ── Packet ────────────────────────────────────────────────────────────────
-class Packet:
-    def __init__(self, bytes_: int, row_start: int, cols: int):
-        self.row_start = row_start
-
-        grid_count     = max(1, math.ceil(bytes_ / BYTES_PER_GRID))
-        self.row_count = math.ceil(grid_count / cols)
-
-        self.grids: list[Grid] = [
-            Grid(
-                i % cols,
-                i // cols,
-                COLOR_CYAN if random.random() < CYAN_CHANCE else COLOR_PINK,
-                self,
-            )
-            for i in range(grid_count)
-        ]
-
-        self._fade_start_at = math.inf
-        self._next_erase_at = math.inf
-        self._fade_idx      = grid_count - 1
-        self._done          = False
-
-    def draw(self):
-        for g in self.grids:
-            g.draw()
-
-    def start(self):
-        self.draw()
-        t = now_ms()
-        self._fade_start_at = t + DISAPPEAR_DELAY
-        self._next_erase_at = self._fade_start_at
-
-    # Called every frame. Returns True when this packet is fully gone.
-    def tick(self, now: float) -> bool:
-        if self._done:
-            return False
-
-        # Restore grids whose flash duration has elapsed
-        for g in self.grids:
-            if not g.cleared and g.flash_until > 0 and now >= g.flash_until:
-                g.flash_until = 0
-                fb.put(g.col, g.abs_row, g.color)
-
-        # Fade: erase one grid per DISAPPEAR_STEP after DISAPPEAR_DELAY
-        if now < self._fade_start_at or now < self._next_erase_at:
-            return False
-
-        while self._fade_idx >= 0 and self.grids[self._fade_idx].cleared:
-            self._fade_idx -= 1
-
-        if self._fade_idx < 0:
-            self._done = True
-            return True  # signal PacketManager to call on_gone
-
-        self.grids[self._fade_idx].erase()
-        self._fade_idx      -= 1
-        self._next_erase_at  = now + DISAPPEAR_STEP
-        return False
-
-    def stop_timers(self):
-        self._fade_start_at = math.inf
-        self._next_erase_at = math.inf
-        self._fade_idx      = -1
-        self._done          = True
-        for g in self.grids:
-            g.stop_flash()
-
-    def swap_one_color(self):
-        live  = [g for g in self.grids if not g.cleared]
-        cyans = [g for g in live if g.color == COLOR_CYAN]
-        pinks = [g for g in live if g.color == COLOR_PINK]
-        if not cyans or not pinks:
-            return
-
-        cg = random.choice(cyans)
-        pg = random.choice(pinks)
-        cg.color = COLOR_PINK
-        pg.color = COLOR_CYAN
-
-        if not cg.flash_until:
-            cg.draw()
-        if not pg.flash_until:
-            pg.draw()
-
-    # Push burst entries into the global flash queue
-    def trigger_flash_bursts(self, burst_count: int, get_all_lit, flash_grids: int, flash_rounds: int):
-        t = now_ms()
-        for b in range(burst_count):
-            for r in range(flash_rounds):
-                if len(flash_queue) >= FLASH_QUEUE_CAP:
-                    return
-                flash_queue.append({
-                    "at":          t + (b * flash_rounds + r) * FLASH_ROUND_DELAY,
-                    "get_all_lit": get_all_lit,
-                    "flash_grids": flash_grids,
-                    "owner":       self,
-                })
-
-
-# ── Flash queue — drained by the main animation loop ─────────────────────
-flash_queue: list[dict] = []
-
-
-# ── PacketManager ─────────────────────────────────────────────────────────
-class PacketManager:
-    def __init__(self, cols: int, rows: int):
-        self.cols           = cols
-        self.rows           = rows
-        self.packets:       list[Packet] = []
-        self.next_row_start = 0
-
-    def add(self, bytes_: int):
-        new_row_count = math.ceil(max(1, math.ceil(bytes_ / BYTES_PER_GRID)) / self.cols)
-        while self.packets and self.next_row_start + new_row_count > self.rows:
-            self._evict_top()
-
-        p = Packet(bytes_, self.next_row_start, self.cols)
-        self.packets.append(p)
-        self.next_row_start += p.row_count
-        p.start()
-
-        if bytes_ > FLASH_THRESHOLD:
-            burst_count  = (bytes_ - FLASH_THRESHOLD) // FLASH_BURST_BYTES
-            flash_grids  = max(1, bytes_ // FLASH_SCALE_BYTES)
-            flash_rounds = max(1, bytes_ // FLASH_SCALE_BYTES)
-            p.trigger_flash_bursts(burst_count, self._all_lit_grids, flash_grids, flash_rounds)
-
-    def _all_lit_grids(self) -> list[Grid]:
-        return [g for p in self.packets for g in p.grids if not g.cleared]
-
-    def _purge_flash_queue(self, owner: Packet):
-        for i in range(len(flash_queue) - 1, -1, -1):
-            if flash_queue[i]["owner"] is owner:
-                flash_queue.pop(i)
-
-    def _shift_packets_up(self, from_idx: int, freed: int):
-        """Erase old positions, shift row_start, redraw at new positions."""
-        for p in self.packets[from_idx:]:
-            for g in p.grids:
-                if not g.cleared:
-                    fb.put(g.col, g.abs_row, COLOR_BG)
-            p.row_start -= freed
-            for g in p.grids:
-                if not g.cleared:
-                    # preserve white for mid-flash grids
-                    fb.put(g.col, g.abs_row, COLOR_WHITE if g.flash_until > 0 else g.color)
-        self.next_row_start -= freed
-
-    def _evict_top(self):
-        top = self.packets.pop(0)
-        top.stop_timers()
-        self._purge_flash_queue(top)
-        self._shift_packets_up(0, top.row_count)
-        for g in self._all_lit_grids():
-            g.flash(swap=False)  # skip swap_one_color during eviction — too expensive under load
-
-    def on_gone(self, packet: Packet):
-        idx = self.packets.index(packet)
-        self.packets.pop(idx)
-        self._purge_flash_queue(packet)
-        self._shift_packets_up(idx, packet.row_count)
-
-    def clear(self):
-        for p in self.packets:
-            p.stop_timers()
-        self.packets.clear()
-        self.next_row_start = 0
-        flash_queue.clear()
-        fb.clear()
+    return np.clip(frame, 0, 255).astype(np.uint8)
 
 
 # ── TCP server — listens for tunnel connection in background thread ────────
@@ -342,26 +242,20 @@ def tcp_server(port: int, incoming: queue.Queue):
 def parse_args():
     parser = argparse.ArgumentParser(description="RGB Matrix Network Art")
 
-    # Tunnel listener
     parser.add_argument("--port", type=int, default=9001,
                         help="TCP port to listen on for tunnel connection (default: 9001)")
 
-    # LED matrix hardware flags
-    parser.add_argument("--led-rows",                 type=int,  default=64)
-    parser.add_argument("--led-cols",                 type=int,  default=64)
-    parser.add_argument("--led-chain",                type=int,  default=1,   dest="led_chain")
-    parser.add_argument("--led-parallel",             type=int,  default=1,   dest="led_parallel")
-    parser.add_argument("--led-pwm-bits",             type=int,  default=7,   dest="led_pwm_bits")
-    parser.add_argument("--led-pwm-dither-bits",      type=int,  default=1,   dest="led_pwm_dither_bits")
-    parser.add_argument("--led-pwm-lsb-nanoseconds",  type=int,  default=50,  dest="led_pwm_lsb_nanoseconds")
-    parser.add_argument("--led-slowdown-gpio",        type=int,  default=3,   dest="led_slowdown_gpio")
-    parser.add_argument("--led-brightness",           type=int,  default=100, dest="led_brightness")
-    parser.add_argument("--led-hardware-mapping",     default="regular",      dest="led_hardware_mapping")
-    parser.add_argument("--led-show-refresh",         action="store_true",    dest="led_show_refresh")
-
-    # Display scaling
-    parser.add_argument("--resolution", type=int, default=1, choices=range(1, 11),
-                        help="Pixels per grid cell 1–10 (default: 1)")
+    parser.add_argument("--led-rows",                type=int,  default=64)
+    parser.add_argument("--led-cols",                type=int,  default=64)
+    parser.add_argument("--led-chain",               type=int,  default=1,   dest="led_chain")
+    parser.add_argument("--led-parallel",            type=int,  default=1,   dest="led_parallel")
+    parser.add_argument("--led-pwm-bits",            type=int,  default=7,   dest="led_pwm_bits")
+    parser.add_argument("--led-pwm-dither-bits",     type=int,  default=1,   dest="led_pwm_dither_bits")
+    parser.add_argument("--led-pwm-lsb-nanoseconds", type=int,  default=50,  dest="led_pwm_lsb_nanoseconds")
+    parser.add_argument("--led-slowdown-gpio",       type=int,  default=3,   dest="led_slowdown_gpio")
+    parser.add_argument("--led-brightness",          type=int,  default=100, dest="led_brightness")
+    parser.add_argument("--led-hardware-mapping",    default="regular",      dest="led_hardware_mapping")
+    parser.add_argument("--led-show-refresh",        action="store_true",    dest="led_show_refresh")
 
     return parser.parse_args()
 
@@ -384,16 +278,12 @@ def main():
     options.show_refresh_rate   = args.led_show_refresh
     options.drop_privileges     = False
 
-    matrix = RGBMatrix(options=options)
-    res    = args.resolution
-    cols   = matrix.width  // res   # logical grid columns
-    rows   = matrix.height // res   # logical grid rows
-    fb.resolution = res
-    print(f"[*] Matrix: {matrix.width}×{matrix.height} pixels | resolution={res} | grid: {cols}×{rows}")
+    matrix   = RGBMatrix(options=options)
+    matrix_w = matrix.width
+    matrix_h = matrix.height
+    print(f"[*] Matrix: {matrix_w}×{matrix_h} pixels")
 
-    manager  = PacketManager(cols=cols, rows=rows)
     incoming: queue.Queue = queue.Queue(maxsize=50)
-
     threading.Thread(
         target=tcp_server,
         args=(args.port, incoming),
@@ -403,50 +293,47 @@ def main():
 
     canvas     = matrix.CreateFrameCanvas()
     frame_sec  = 1.0 / TARGET_FPS
+    prev_frame = np.zeros((matrix_h, matrix_w, 3), dtype=np.uint8)
 
     try:
         while True:
             loop_start = time.monotonic()
-            now        = loop_start * 1000  # ms
+            now        = loop_start * 1000
 
-            # Drain incoming packets — cap at 10 per frame to avoid frame stalls
+            # Drain incoming packets — cap at 10 per frame to avoid stalls
             for _ in range(10):
                 try:
-                    manager.add(incoming.get_nowait())
+                    spawn_burst(incoming.get_nowait(), matrix_w, matrix_h)
                 except queue.Empty:
                     break
 
-            # Fire due flash bursts (iterate backwards so pop doesn't shift indices)
-            i = len(flash_queue) - 1
-            while i >= 0:
-                entry = flash_queue[i]
-                if now >= entry["at"]:
-                    flash_queue.pop(i)
-                    lit   = entry["get_all_lit"]()
-                    count = min(entry["flash_grids"], len(lit))
-                    for j in range(count):
-                        k = j + (random.randint(0, len(lit) - j - 1) if len(lit) - j > 1 else 0)
-                        lit[j], lit[k] = lit[k], lit[j]
-                        lit[j].flash()
-                i -= 1
+            # Render composite frame
+            frame = render_frame(matrix_w, matrix_h, now)
 
-            # Tick each packet; collect finished ones
-            done = [p for p in manager.packets if p.tick(now)]
-            for p in done:
-                manager.on_gone(p)
+            # Write only pixels that changed since last frame to the front canvas
+            diff_mask = np.any(frame != prev_frame, axis=2)
+            ys, xs    = np.where(diff_mask)
+            for yi, xi in zip(ys.tolist(), xs.tolist()):
+                canvas.SetPixel(int(xi), int(yi),
+                                int(frame[yi, xi, 0]),
+                                int(frame[yi, xi, 1]),
+                                int(frame[yi, xi, 2]))
 
-            # Flush dirty pixels to the front canvas, capture which coords changed
-            flushed = fb.flush(canvas)
+            prev_frame = frame
+            canvas     = matrix.SwapOnVSync(canvas)
 
-            # Swap — canvas is now displayed; returned canvas is the back buffer
-            canvas = matrix.SwapOnVSync(canvas)
+            # Sync back-buffer: apply the same changed pixels so both buffers match
+            for yi, xi in zip(ys.tolist(), xs.tolist()):
+                canvas.SetPixel(int(xi), int(yi),
+                                int(frame[yi, xi, 0]),
+                                int(frame[yi, xi, 1]),
+                                int(frame[yi, xi, 2]))
 
-            # Keep the back buffer in sync: apply the same cells that just changed
-            for (col, row) in flushed:
-                r, g, b = fb._pixels.get((col, row), COLOR_BG)
-                fb._set_cell(canvas, col, row, r, g, b)
-
-            # SwapOnVSync already blocks until the next hardware vsync — no extra sleep needed
+            # SwapOnVSync blocks for hardware vsync; sleep any remaining budget
+            elapsed   = time.monotonic() - loop_start
+            remaining = frame_sec - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
 
     except KeyboardInterrupt:
         matrix.Clear()
