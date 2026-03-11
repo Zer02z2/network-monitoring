@@ -2,11 +2,11 @@
 """
 RGB Matrix renderer for Network Traffic Monitor.
 
-Connects to the sniffer TCP stream and renders the same art visualization
+Listens for an incoming tunnel connection and renders the same art visualization
 as the browser canvas onto a physical RGB LED matrix.
 
 Usage:
-    sudo python3 matrix.py -ip 127.0.0.1 -port 9000 \
+    sudo python3 matrix.py --port 9001 \
         --led-chain=3 --led-parallel=3 --led-rows=64 --led-cols=64 \
         --led-pwm-bits=7 --led-pwm-dither-bits=1 \
         --led-slowdown-gpio=3 --led-pwm-lsb-nanoseconds=50 \
@@ -299,47 +299,52 @@ class PacketManager:
         fb.clear()
 
 
-# ── TCP client — runs in background thread ────────────────────────────────
-def tcp_client(host: str, port: int, incoming: queue.Queue):
-    while True:
-        try:
-            with socket.create_connection((host, port)) as sock:
-                print(f"[*] Connected to sniffer at {host}:{port}")
-                buf = ""
-                while True:
-                    chunk = sock.recv(4096).decode("utf-8", errors="ignore")
-                    if not chunk:
-                        break
-                    buf += chunk
-                    lines = buf.split("\n")
-                    buf = lines.pop()
-                    for line in lines:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            data = json.loads(line)
-                            if data.get("type") in ("traffic", "new_ip"):
-                                try:
-                                    incoming.put_nowait(data.get("length", 0))
-                                except queue.Full:
-                                    pass  # drop packet — main loop is behind, don't block TCP reader
-                        except json.JSONDecodeError:
-                            pass
-        except Exception as e:
-            print(f"[!] Sniffer connection error: {e}. Retrying in 3 s...")
-            time.sleep(3)
+# ── TCP server — listens for tunnel connection in background thread ────────
+def tcp_server(port: int, incoming: queue.Queue):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", port))
+        srv.listen(1)
+        print(f"[*] Listening for tunnel on port {port}")
+        while True:
+            try:
+                conn, addr = srv.accept()
+                print(f"[+] Tunnel connected from {addr}")
+                with conn:
+                    buf = ""
+                    while True:
+                        chunk = conn.recv(4096).decode("utf-8", errors="ignore")
+                        if not chunk:
+                            break
+                        buf += chunk
+                        lines = buf.split("\n")
+                        buf = lines.pop()
+                        for line in lines:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                data = json.loads(line)
+                                if data.get("type") in ("traffic", "new_ip"):
+                                    try:
+                                        incoming.put_nowait(data.get("length", 0))
+                                    except queue.Full:
+                                        pass  # drop — main loop is behind, don't block
+                            except json.JSONDecodeError:
+                                pass
+                print(f"[-] Tunnel disconnected from {addr}")
+            except Exception as e:
+                print(f"[!] Server error: {e}")
+                time.sleep(1)
 
 
 # ── Argument parsing ──────────────────────────────────────────────────────
 def parse_args():
     parser = argparse.ArgumentParser(description="RGB Matrix Network Art")
 
-    # Sniffer connection
-    parser.add_argument("-ip",   default="127.0.0.1",
-                        help="Sniffer host/mDNS name (default: 127.0.0.1)")
-    parser.add_argument("-port", type=int, default=9000,
-                        help="Sniffer TCP port (default: 9000)")
+    # Tunnel listener
+    parser.add_argument("--port", type=int, default=9001,
+                        help="TCP port to listen on for tunnel connection (default: 9001)")
 
     # LED matrix hardware flags
     parser.add_argument("--led-rows",                 type=int,  default=64)
@@ -385,16 +390,15 @@ def main():
     rows   = matrix.height // res   # logical grid rows
     fb.resolution = res
     print(f"[*] Matrix: {matrix.width}×{matrix.height} pixels | resolution={res} | grid: {cols}×{rows}")
-    print(f"[*] Connecting to sniffer at {args.ip}:{args.port}")
 
     manager  = PacketManager(cols=cols, rows=rows)
     incoming: queue.Queue = queue.Queue(maxsize=50)
 
     threading.Thread(
-        target=tcp_client,
-        args=(args.ip, args.port, incoming),
+        target=tcp_server,
+        args=(args.port, incoming),
         daemon=True,
-        name="tcp-client",
+        name="tcp-server",
     ).start()
 
     canvas     = matrix.CreateFrameCanvas()

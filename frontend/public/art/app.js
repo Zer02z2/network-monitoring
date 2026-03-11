@@ -1,291 +1,187 @@
 // ── TUNABLE CONFIG ────────────────────────────────────────────────────────
-const GRID_SIZE         = 10   // px — width & height of each grid cell
-const CELL_GAP          = 1    // px — gap between cells on each side
-const BYTES_PER_GRID    = 20   // bytes per grid cell (ceil)
-const DISAPPEAR_DELAY   = 100  // ms — pause before a packet's cells start fading
-const DISAPPEAR_STEP    = 5    // ms — time between each cell erasing
-const FLASH_THRESHOLD   = 300  // bytes — minimum size to trigger white flash bursts
-const FLASH_BURST_BYTES = 100  // bytes per burst (decoupled from BYTES_PER_GRID)
-const FLASH_SCALE_BYTES = 200  // bytes per interval — each interval adds 1 flash grid
-const FLASH_ROUND_DELAY = 10   // ms — gap between bursts
-const FLASH_QUEUE_CAP   = 100  // max total entries in flash queue at any time
-const FLASH_DURATION    = 50   // ms — how long a grid stays white
-const CYAN_CHANCE       = 0.15 // 0–1 — probability a new grid is cyan vs pink
+const RECT_BASE_COUNT = 2 // rects spawned per burst regardless of size
+const RECT_SCALE = 0.0012 // additional rects per byte
+const RECT_MAX_COUNT = 28 // max rects per single burst
+const RECT_MIN_W = 20 // px — min rect width
+const RECT_MAX_W = 700 // px — max rect width
+const RECT_MIN_H = 2 // px — min rect height (can be hairline thin)
+const RECT_MAX_H = 400 // px — max rect height
+const RECT_LIFETIME = 100 // ms — base lifetime
+const RECT_LIFETIME_VAR = 0.7 // randomness factor on lifetime
+const RECT_ALPHA_MIN = 0.22 // starting alpha minimum
+const RECT_ALPHA_MAX = 0.75 // starting alpha maximum
+const RED_CHANCE = 0.78 // probability of neon red vs neon blue
+const STROKE_CHANCE = 0.22 // probability of outline-only rect
 
-const COLOR_BG    = "#000000"
-const COLOR_PINK  = "#ff2d6f"
-const COLOR_CYAN  = "#00ffe0"
-const COLOR_WHITE = "#ffffff"
+const Y_SPREAD = 0.28 // spread around stream Y as fraction of screen height
+const Y_RANDOM_CHANCE = 0.05 // probability of fully random Y
+const Y_OPPOSITE_CHANCE = 0.09 // probability of spawning near opposite side of screen
+const STREAM_PER_BYTE = 0.00006 // how much stream position advances per byte (0–1)
+
+const FLASH_THRESHOLD = 600 // bytes — triggers white flash rect
+const FLASH_ALPHA_MIN = 0.75
+const FLASH_ALPHA_MAX = 0.95
+const FLASH_LIFETIME = 50 // ms — white flash is short and brutal
+const FLASH_MAX_COUNT = 3 // max white flash rects per burst
+
+const MAX_RECTS = 350 // global cap — oldest pruned when exceeded
+
+const COLOR_BG = "#000000"
+const NEON_RED = [255, 15, 45]
+const NEON_BLUE = [2, 212, 240]
+const NEON_WHITE = [255, 255, 255]
 // ─────────────────────────────────────────────────────────────────────────
 
 const canvas = document.getElementById("canvas")
-const ctx    = canvas.getContext("2d")
+const ctx = canvas.getContext("2d")
 
-let COLS = 0
-let ROWS = 0
+// Normalized stream position 0..1 — advances with each packet, drives top→down flow
+let streamY = 0.05
 
-// ── Canvas primitives ─────────────────────────────────────────────────────
-const drawCell = (col, row, color) => {
-  ctx.fillStyle = color
-  ctx.fillRect(
-    col * GRID_SIZE + CELL_GAP,
-    row * GRID_SIZE + CELL_GAP,
-    GRID_SIZE - CELL_GAP * 2,
-    GRID_SIZE - CELL_GAP * 2,
+// All active rects: { x, y, w, h, rgb, alpha, createdAt, dieAt, stroke, isFlash }
+const rects = []
+
+// ── Y distribution ────────────────────────────────────────────────────────
+// Weighted toward streamY, with tails toward opposite side and pure random
+const pickY = (baseY, h) => {
+  const r = Math.random()
+  let center
+  if (r < Y_RANDOM_CHANCE) {
+    return Math.random() * Math.max(0, canvas.height - h)
+  } else if (r < Y_RANDOM_CHANCE + Y_OPPOSITE_CHANCE) {
+    center = canvas.height - baseY // opposite side
+  } else {
+    center = baseY
+  }
+  // Two-uniform sum approximates Gaussian (CLT)
+  const spread = Y_SPREAD * canvas.height
+  const y = center + (Math.random() + Math.random() - 1) * spread
+  return Math.max(0, Math.min(canvas.height - h, y))
+}
+
+// ── Spawn burst ───────────────────────────────────────────────────────────
+const spawnBurst = (bytes) => {
+  const baseY = streamY * canvas.height
+  const count = Math.min(
+    RECT_MAX_COUNT,
+    RECT_BASE_COUNT + Math.floor(bytes * RECT_SCALE),
   )
+  const now = performance.now()
+
+  for (let i = 0; i < count; i++) {
+    // Size scales with bytes — large packets can fill more of the screen
+    const maxW =
+      RECT_MIN_W + Math.min(1, bytes / 2000) * (RECT_MAX_W - RECT_MIN_W)
+    const maxH =
+      RECT_MIN_H + Math.min(1, bytes / 3000) * (RECT_MAX_H - RECT_MIN_H)
+    const w = RECT_MIN_W + Math.random() * (maxW - RECT_MIN_W)
+    const h = RECT_MIN_H + Math.random() * (maxH - RECT_MIN_H)
+
+    const x = Math.random() * Math.max(0, canvas.width - w)
+    const y = pickY(baseY, h)
+    const rgb = Math.random() < RED_CHANCE ? NEON_RED : NEON_BLUE
+    const alpha =
+      RECT_ALPHA_MIN + Math.random() * (RECT_ALPHA_MAX - RECT_ALPHA_MIN)
+    const life =
+      RECT_LIFETIME *
+      (1 - RECT_LIFETIME_VAR * 0.5 + Math.random() * RECT_LIFETIME_VAR)
+    const stroke = Math.random() < STROKE_CHANCE
+
+    rects.push({
+      x,
+      y,
+      w,
+      h,
+      rgb,
+      alpha,
+      createdAt: now,
+      dieAt: now + life,
+      stroke,
+      isFlash: false,
+    })
+  }
+
+  // White flash rects for large packets — count scales with size
+  if (bytes >= FLASH_THRESHOLD) {
+    const intensity = Math.min(1, (bytes - FLASH_THRESHOLD) / 5000)
+    const flashCount = 1 + Math.floor(intensity * (FLASH_MAX_COUNT - 1))
+    for (let f = 0; f < flashCount; f++) {
+      const fw = canvas.width * (0.25 + Math.random() * 0.7)
+      const fh = canvas.height * (0.03 + intensity * 0.3 + Math.random() * 0.12)
+      const fx = Math.random() * Math.max(0, canvas.width - fw)
+      const fy = pickY(baseY, fh)
+      const fa =
+        FLASH_ALPHA_MIN +
+        intensity * (FLASH_ALPHA_MAX - FLASH_ALPHA_MIN) * Math.random()
+      rects.push({
+        x: fx,
+        y: fy,
+        w: fw,
+        h: fh,
+        rgb: NEON_WHITE,
+        alpha: fa,
+        createdAt: now,
+        dieAt: now + FLASH_LIFETIME * (0.6 + Math.random() * 0.8),
+        stroke: Math.random() < 0.45,
+        isFlash: true,
+      })
+    }
+  }
+
+  // Advance stream position — large bursts push it further down the screen
+  streamY = (streamY + bytes * STREAM_PER_BYTE) % 1
+
+  // Prune oldest rects if over global cap
+  if (rects.length > MAX_RECTS) rects.splice(0, rects.length - MAX_RECTS)
 }
-
-const eraseCell = (col, row) => {
-  ctx.fillStyle = COLOR_BG
-  ctx.fillRect(col * GRID_SIZE, row * GRID_SIZE, GRID_SIZE, GRID_SIZE)
-}
-
-// ── Grid ──────────────────────────────────────────────────────────────────
-// Each grid tracks a _flashUntil timestamp instead of a timer handle.
-// The RAF loop restores color when the timestamp is reached.
-class Grid {
-  constructor(col, relRow, color, packet) {
-    this.col         = col
-    this.relRow      = relRow
-    this.color       = color   // mutable — swapOneColor changes this live
-    this.packet      = packet  // back-ref so absRow is always current
-    this.cleared     = false
-    this._flashUntil = 0       // RAF timestamp for flash restore; 0 = not flashing
-  }
-
-  get absRow() { return this.packet.rowStart + this.relRow }
-
-  draw() {
-    if (!this.cleared) drawCell(this.col, this.absRow, this.color)
-  }
-
-  // Locked: ignored if already flashing (_flashUntil > 0)
-  flash() {
-    if (this.cleared || this._flashUntil > 0) return
-    this._flashUntil = performance.now() + FLASH_DURATION
-    drawCell(this.col, this.absRow, COLOR_WHITE)
-    this.packet.swapOneColor()
-  }
-
-  // Fade wins: clears flash state immediately without waiting
-  erase() {
-    this._flashUntil = 0
-    this.cleared     = true
-    eraseCell(this.col, this.absRow)
-  }
-
-  stopFlash() { this._flashUntil = 0 }
-}
-
-// ── Packet ────────────────────────────────────────────────────────────────
-// Uses RAF timestamps instead of setInterval/setTimeout.
-// tick(now) is called every frame; returns true when fully faded.
-class Packet {
-  constructor(bytes, rowStart) {
-    this.rowStart = rowStart
-
-    const gridCount   = Math.max(1, Math.ceil(bytes / BYTES_PER_GRID))
-    this.rowCount     = Math.ceil(gridCount / COLS)
-
-    this.grids = Array.from({ length: gridCount }, (_, i) =>
-      new Grid(
-        i % COLS,
-        Math.floor(i / COLS),
-        Math.random() < CYAN_CHANCE ? COLOR_CYAN : COLOR_PINK,
-        this,
-      )
-    )
-
-    this._fadeStartAt = Infinity
-    this._nextEraseAt = Infinity
-    this._fadeIdx     = gridCount - 1
-    this._done        = false
-  }
-
-  draw() { this.grids.forEach(g => g.draw()) }
-
-  start() {
-    this.draw()
-    const now         = performance.now()
-    this._fadeStartAt = now + DISAPPEAR_DELAY
-    this._nextEraseAt = this._fadeStartAt
-  }
-
-  // Called every RAF frame. Returns true when this packet is fully gone.
-  tick(now) {
-    if (this._done) return false
-
-    // Restore grids whose flash duration has elapsed
-    for (const g of this.grids) {
-      if (!g.cleared && g._flashUntil > 0 && now >= g._flashUntil) {
-        g._flashUntil = 0
-        drawCell(g.col, g.absRow, g.color)
-      }
-    }
-
-    // Fade: erase one grid per DISAPPEAR_STEP after DISAPPEAR_DELAY
-    if (now < this._fadeStartAt || now < this._nextEraseAt) return false
-
-    while (this._fadeIdx >= 0 && this.grids[this._fadeIdx].cleared) this._fadeIdx--
-    if (this._fadeIdx < 0) {
-      this._done = true
-      return true  // signal PacketManager to call _onGone
-    }
-
-    this.grids[this._fadeIdx--].erase()
-    this._nextEraseAt = now + DISAPPEAR_STEP
-    return false
-  }
-
-  // Stop all animation for this packet (resize / eviction)
-  stopTimers() {
-    this._fadeStartAt = Infinity
-    this._nextEraseAt = Infinity
-    this._fadeIdx     = -1
-    this._done        = true
-    this.grids.forEach(g => g.stopFlash())
-  }
-
-  // Swap one random cyan ↔ one random pink within this packet.
-  swapOneColor() {
-    const live  = this.grids.filter(g => !g.cleared)
-    const cyans = live.filter(g => g.color === COLOR_CYAN)
-    const pinks = live.filter(g => g.color === COLOR_PINK)
-    if (!cyans.length || !pinks.length) return
-
-    const cyanGrid = cyans[Math.floor(Math.random() * cyans.length)]
-    const pinkGrid = pinks[Math.floor(Math.random() * pinks.length)]
-
-    cyanGrid.color = COLOR_PINK
-    pinkGrid.color = COLOR_CYAN
-
-    if (!cyanGrid._flashUntil) cyanGrid.draw()
-    if (!pinkGrid._flashUntil) pinkGrid.draw()
-  }
-
-  // Push burst entries into the global flash queue instead of using setTimeout.
-  // Each entry is tagged with this packet as owner so eviction can purge them.
-  // Stops pushing if the queue hits FLASH_QUEUE_CAP to prevent flooding.
-  triggerFlashBursts(burstCount, getAllLitGrids, flashGrids, flashRounds) {
-    const now = performance.now()
-    for (let b = 0; b < burstCount; b++) {
-      for (let r = 0; r < flashRounds; r++) {
-        if (flashQueue.length >= FLASH_QUEUE_CAP) return
-        flashQueue.push({ at: now + (b * flashRounds + r) * FLASH_ROUND_DELAY, getAllLitGrids, flashGrids, owner: this })
-      }
-    }
-  }
-}
-
-// ── Flash queue — populated by triggerFlashBursts, drained by RAF tick ────
-const flashQueue = []
-
-// ── PacketManager ─────────────────────────────────────────────────────────
-class PacketManager {
-  constructor() {
-    this.packets      = []
-    this.nextRowStart = 0
-  }
-
-  add(bytes) {
-    // Evict top packets until the new packet fits within the canvas
-    const newRowCount = Math.ceil(Math.max(1, Math.ceil(bytes / BYTES_PER_GRID)) / COLS)
-    while (this.packets.length && this.nextRowStart + newRowCount > ROWS) {
-      this._evictTop()
-    }
-
-    const p = new Packet(bytes, this.nextRowStart)
-    this.packets.push(p)
-    this.nextRowStart += p.rowCount
-    p.start()
-
-    if (bytes > FLASH_THRESHOLD) {
-      const burstCount  = Math.floor((bytes - FLASH_THRESHOLD) / FLASH_BURST_BYTES)
-      const flashGrids  = Math.max(1, Math.floor(bytes / FLASH_SCALE_BYTES))
-      const flashRounds = Math.max(1, Math.floor(bytes / FLASH_SCALE_BYTES))
-      p.triggerFlashBursts(burstCount, () => this._allLitGrids(), flashGrids, flashRounds)
-    }
-  }
-
-  _allLitGrids() {
-    return this.packets.flatMap(p => p.grids.filter(g => !g.cleared))
-  }
-
-  // Force-remove the oldest (top) packet; blit remaining pixels upward.
-  // Flashes all surviving lit grids once as a visual eviction signal.
-  _evictTop() {
-    const top = this.packets.shift()
-    top.stopTimers()
-    for (let i = flashQueue.length - 1; i >= 0; i--) {
-      if (flashQueue[i].owner === top) flashQueue.splice(i, 1)
-    }
-
-    const freed     = top.rowCount
-    for (const p of this.packets) p.rowStart -= freed
-    this.nextRowStart -= freed
-
-    const srcY      = freed * GRID_SIZE
-    const remaining = canvas.height - srcY
-    if (remaining > 0) {
-      ctx.drawImage(canvas, 0, srcY, canvas.width, remaining, 0, 0, canvas.width, remaining)
-    }
-    ctx.fillStyle = COLOR_BG
-    ctx.fillRect(0, canvas.height - freed * GRID_SIZE, canvas.width, freed * GRID_SIZE)
-
-    this._allLitGrids().forEach(g => g.flash())
-  }
-
-  _onGone(packet) {
-    const idx = this.packets.indexOf(packet)
-    if (idx === -1) return
-    this.packets.splice(idx, 1)
-    for (let i = flashQueue.length - 1; i >= 0; i--) {
-      if (flashQueue[i].owner === packet) flashQueue.splice(i, 1)
-    }
-
-    const freed = packet.rowCount
-    for (let i = idx; i < this.packets.length; i++) {
-      this.packets[i].rowStart -= freed
-    }
-    this.nextRowStart -= freed
-
-    ctx.fillStyle = COLOR_BG
-    ctx.fillRect(0, 0, canvas.width, canvas.height)
-    this.packets.forEach(p => p.draw())
-  }
-
-  clear() {
-    this.packets.forEach(p => p.stopTimers())
-    this.packets.length = 0
-    this.nextRowStart   = 0
-    flashQueue.length   = 0
-  }
-}
-
-const manager = new PacketManager()
 
 // ── RAF loop ──────────────────────────────────────────────────────────────
 const tick = (now) => {
-  // Fire due flash bursts (iterate backwards so splice indices stay valid)
-  for (let i = flashQueue.length - 1; i >= 0; i--) {
-    if (now < flashQueue[i].at) continue
-    const { getAllLitGrids, flashGrids } = flashQueue.splice(i, 1)[0]
-    const lit   = getAllLitGrids()
-    const count = Math.min(flashGrids, lit.length)
-    for (let j = 0; j < count; j++) {
-      const k = j + Math.floor(Math.random() * (lit.length - j))
-      ;[lit[j], lit[k]] = [lit[k], lit[j]]
-      lit[j].flash()
+  // Full clear each frame — essential for correct alpha compositing
+  ctx.fillStyle = COLOR_BG
+  ctx.fillRect(0, 0, canvas.width, canvas.height)
+
+  // Draw rects oldest→newest so newer ones composite on top
+  let i = 0
+  while (i < rects.length) {
+    const r = rects[i]
+    if (now >= r.dieAt) {
+      rects.splice(i, 1)
+      continue
     }
+
+    const age = now - r.createdAt
+    const lifetime = r.dieAt - r.createdAt
+    let alpha
+
+    if (r.isFlash) {
+      // Flash: cosine ease — hits instantly, fades smoothly
+      alpha = r.alpha * Math.pow(Math.cos((age / lifetime) * Math.PI * 0.5), 2)
+    } else {
+      // Regular: hold alpha for first 15%, then linear fade to 0
+      const hold = lifetime * 0.15
+      const fadeT = age < hold ? 0 : (age - hold) / (lifetime - hold)
+      alpha = r.alpha * Math.max(0, 1 - fadeT)
+    }
+
+    ctx.globalAlpha = alpha
+    const [red, green, blue] = r.rgb
+    const color = `rgb(${red},${green},${blue})`
+
+    if (r.stroke) {
+      ctx.strokeStyle = color
+      // Slight line-width jitter per frame — deliberate glitch flicker
+      ctx.lineWidth = 1 + Math.random() * 0.8
+      ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w, r.h)
+    } else {
+      ctx.fillStyle = color
+      ctx.fillRect(r.x, r.y, r.w, r.h)
+    }
+
+    i++
   }
 
-  // Tick each packet; collect finished ones to avoid mutating the array mid-loop
-  const done = []
-  for (const p of manager.packets) {
-    if (p.tick(now)) done.push(p)
-  }
-  for (const p of done) manager._onGone(p)
-
+  ctx.globalAlpha = 1
   requestAnimationFrame(tick)
 }
 
@@ -293,11 +189,10 @@ requestAnimationFrame(tick)
 
 // ── Canvas init / resize ──────────────────────────────────────────────────
 const initCanvas = () => {
-  manager.clear()
-  canvas.width  = window.innerWidth
+  rects.length = 0
+  streamY = 0.05
+  canvas.width = window.innerWidth
   canvas.height = window.innerHeight
-  COLS = Math.floor(canvas.width  / GRID_SIZE)
-  ROWS = Math.floor(canvas.height / GRID_SIZE)
   ctx.fillStyle = COLOR_BG
   ctx.fillRect(0, 0, canvas.width, canvas.height)
 }
@@ -309,11 +204,14 @@ initCanvas()
 const connect = () => {
   const ws = new WebSocket(`ws://${location.host}`)
 
-  ws.onmessage = evt => {
+  ws.onmessage = (evt) => {
     try {
       const data = JSON.parse(evt.data)
-      if (data.type === "traffic" || data.type === "new_ip") manager.add(data.length || 0)
-    } catch { /* ignore parse errors */ }
+      if (data.type === "traffic" || data.type === "new_ip")
+        spawnBurst(data.length || 0)
+    } catch {
+      /* ignore */
+    }
   }
 
   ws.onclose = () => setTimeout(connect, 3000)

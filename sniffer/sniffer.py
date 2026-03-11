@@ -40,20 +40,20 @@ def _get_local_ip() -> str:
 def parse_args():
     parser = argparse.ArgumentParser(description="Network Traffic Sniffer")
     parser.add_argument(
-        "-names", nargs="+", required=True,
+        "--names", nargs="+", required=True,
         help="Domain names to watch via TLS SNI and DNS (e.g. openai.com chatgpt.com)"
     )
     parser.add_argument(
-        "-port", type=int, default=9000,
+        "--port", type=int, default=9000,
         help="TCP port to stream JSON traffic on (default: 9000)"
     )
     parser.add_argument(
-        "-interface", default="en0",
+        "--interface", default="en0",
         help="Network interface to capture on (default: en0)"
     )
     parser.add_argument(
-        "-send-interval", type=int, default=1, dest="send_interval",
-        help="ms between each queued event being sent to clients (default: 5)"
+        "--send-interval", type=int, default=1, dest="send_interval",
+        help="ms between each queued event being sent to clients (default: 1)"
     )
     return parser.parse_args()
 
