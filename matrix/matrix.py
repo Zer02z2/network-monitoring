@@ -24,6 +24,7 @@ import threading
 import time
 
 import numpy as np
+from PIL import Image
 from rgbmatrix import RGBMatrix, RGBMatrixOptions
 
 # ── TUNABLE CONFIG ─────────────────────────────────────────────────────────
@@ -55,7 +56,7 @@ FLASH_ALPHA_MAX   = 1
 FLASH_LIFETIME    = 50    # ms — white flash is short and brutal
 FLASH_MAX_COUNT   = 3
 
-MAX_RECTS         = 350    # global cap — oldest pruned when exceeded
+MAX_RECTS         = 120    # global cap — oldest pruned when exceeded
 TARGET_FPS        = 30     # conservative for Pi CPU budget
 
 NEON_RED   = (255,  15,  45)
@@ -291,9 +292,8 @@ def main():
         name="tcp-server",
     ).start()
 
-    canvas     = matrix.CreateFrameCanvas()
-    frame_sec  = 1.0 / TARGET_FPS
-    prev_frame = np.zeros((matrix_h, matrix_w, 3), dtype=np.uint8)
+    canvas    = matrix.CreateFrameCanvas()
+    frame_sec = 1.0 / TARGET_FPS
 
     try:
         while True:
@@ -310,24 +310,14 @@ def main():
             # Render composite frame
             frame = render_frame(matrix_w, matrix_h, now)
 
-            # Write only pixels that changed since last frame to the front canvas
-            diff_mask = np.any(frame != prev_frame, axis=2)
-            ys, xs    = np.where(diff_mask)
-            for yi, xi in zip(ys.tolist(), xs.tolist()):
-                canvas.SetPixel(int(xi), int(yi),
-                                int(frame[yi, xi, 0]),
-                                int(frame[yi, xi, 1]),
-                                int(frame[yi, xi, 2]))
+            # Write full frame in one C call — far faster than per-pixel SetPixel
+            pil_img = Image.fromarray(frame, "RGB")
+            canvas.SetImage(pil_img)
 
-            prev_frame = frame
-            canvas     = matrix.SwapOnVSync(canvas)
+            canvas = matrix.SwapOnVSync(canvas)
 
-            # Sync back-buffer: apply the same changed pixels so both buffers match
-            for yi, xi in zip(ys.tolist(), xs.tolist()):
-                canvas.SetPixel(int(xi), int(yi),
-                                int(frame[yi, xi, 0]),
-                                int(frame[yi, xi, 1]),
-                                int(frame[yi, xi, 2]))
+            # Sync back-buffer with the same image (both hardware buffers must match)
+            canvas.SetImage(pil_img)
 
             # SwapOnVSync blocks for hardware vsync; sleep any remaining budget
             elapsed   = time.monotonic() - loop_start
