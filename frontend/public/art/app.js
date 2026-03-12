@@ -13,6 +13,8 @@ const RECT_ALPHA_MAX = 0.75 // starting alpha maximum
 const RED_CHANCE = 0.78 // probability of neon red vs neon blue
 const STROKE_CHANCE = 0.22 // probability of outline-only rect
 
+const RECT_SPEED = 10000 // px/s — speed of directional rects (incoming = down, outgoing = up)
+
 const Y_SPREAD = 0.28 // spread around stream Y as fraction of screen height
 const Y_RANDOM_CHANCE = 0.05 // probability of fully random Y
 const Y_OPPOSITE_CHANCE = 0.09 // probability of spawning near opposite side of screen
@@ -38,8 +40,13 @@ const ctx = canvas.getContext("2d")
 // Normalized stream position 0..1 — advances with each packet, drives top→down flow
 let streamY = 0.05
 
-// All active rects: { x, y, w, h, rgb, alpha, createdAt, dieAt, stroke, isFlash }
+// All active rects: { x, y, w, h, rgb, alpha, createdAt, dieAt, stroke, isFlash, vy }
+// vy > 0 = moving down (incoming from tracked IP)
+// vy < 0 = moving up   (outgoing to tracked IP)
+// vy = 0 = stationary  (no direction / flash)
 const rects = []
+
+let lastTick = 0
 
 // ── Y distribution ────────────────────────────────────────────────────────
 // Weighted toward streamY, with tails toward opposite side and pure random
@@ -60,7 +67,16 @@ const pickY = (baseY, h) => {
 }
 
 // ── Spawn burst ───────────────────────────────────────────────────────────
-const spawnBurst = (bytes) => {
+// direction: "incoming" = rects shoot downward
+//            "outgoing" = rects shoot upward
+//            undefined  = stationary, fades as before
+const spawnBurst = (bytes, direction) => {
+  const vy =
+    direction === "incoming"
+      ? RECT_SPEED
+      : direction === "outgoing"
+        ? -RECT_SPEED
+        : 0
   const baseY = streamY * canvas.height
   const count = Math.min(
     RECT_MAX_COUNT,
@@ -86,6 +102,8 @@ const spawnBurst = (bytes) => {
       RECT_LIFETIME *
       (1 - RECT_LIFETIME_VAR * 0.5 + Math.random() * RECT_LIFETIME_VAR)
     const stroke = Math.random() < STROKE_CHANCE
+    // Moving rects die when off-screen; stationary rects die by lifetime
+    const dieAt = vy !== 0 ? Infinity : now + life
 
     rects.push({
       x,
@@ -95,9 +113,10 @@ const spawnBurst = (bytes) => {
       rgb,
       alpha,
       createdAt: now,
-      dieAt: now + life,
+      dieAt,
       stroke,
       isFlash: false,
+      vy,
     })
   }
 
@@ -124,6 +143,7 @@ const spawnBurst = (bytes) => {
         dieAt: now + FLASH_LIFETIME * (0.6 + Math.random() * 0.8),
         stroke: Math.random() < 0.45,
         isFlash: true,
+        vy: 0,
       })
     }
   }
@@ -137,6 +157,9 @@ const spawnBurst = (bytes) => {
 
 // ── RAF loop ──────────────────────────────────────────────────────────────
 const tick = (now) => {
+  const dt = lastTick > 0 ? (now - lastTick) / 1000 : 0 // seconds since last frame
+  lastTick = now
+
   // Full clear each frame — essential for correct alpha compositing
   ctx.fillStyle = COLOR_BG
   ctx.fillRect(0, 0, canvas.width, canvas.height)
@@ -145,20 +168,32 @@ const tick = (now) => {
   let i = 0
   while (i < rects.length) {
     const r = rects[i]
-    if (now >= r.dieAt) {
+
+    // Move directional rects
+    r.y += r.vy * dt
+
+    // Death: off-screen for moving rects, lifetime for stationary/flash
+    const offBottom = r.vy > 0 && r.y > canvas.height
+    const offTop = r.vy < 0 && r.y + r.h < 0
+    if (offBottom || offTop || now >= r.dieAt) {
       rects.splice(i, 1)
       continue
     }
 
-    const age = now - r.createdAt
-    const lifetime = r.dieAt - r.createdAt
     let alpha
 
     if (r.isFlash) {
       // Flash: cosine ease — hits instantly, fades smoothly
+      const age = now - r.createdAt
+      const lifetime = r.dieAt - r.createdAt
       alpha = r.alpha * Math.pow(Math.cos((age / lifetime) * Math.PI * 0.5), 2)
+    } else if (r.vy !== 0) {
+      // Moving rects: hold full alpha throughout travel
+      alpha = r.alpha
     } else {
-      // Regular: hold alpha for first 15%, then linear fade to 0
+      // Stationary: hold alpha for first 15%, then linear fade to 0
+      const age = now - r.createdAt
+      const lifetime = r.dieAt - r.createdAt
       const hold = lifetime * 0.15
       const fadeT = age < hold ? 0 : (age - hold) / (lifetime - hold)
       alpha = r.alpha * Math.max(0, 1 - fadeT)
@@ -191,6 +226,7 @@ requestAnimationFrame(tick)
 const initCanvas = () => {
   rects.length = 0
   streamY = 0.05
+  lastTick = 0
   canvas.width = window.innerWidth
   canvas.height = window.innerHeight
   ctx.fillStyle = COLOR_BG
@@ -208,7 +244,7 @@ const connect = () => {
     try {
       const data = JSON.parse(evt.data)
       if (data.type === "traffic" || data.type === "new_ip")
-        spawnBurst(data.length || 0)
+        spawnBurst(data.length || 0, data.direction)
     } catch {
       /* ignore */
     }

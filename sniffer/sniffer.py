@@ -411,6 +411,7 @@ class Sniffer:
                 if matched_ip is not None:
                     info = self._packet_info(packet, event_type="traffic")
                     info["matched_names"] = self.ip_to_names.get(matched_ip, [])
+                    info["direction"] = "outgoing" if dst_ip in self.known_ips else "incoming"
                     self._broadcast(info)
 
         except Exception as exc:
