@@ -40,8 +40,12 @@ def _get_local_ip() -> str:
 def parse_args():
     parser = argparse.ArgumentParser(description="Network Traffic Sniffer")
     parser.add_argument(
-        "--names", nargs="+", required=True,
+        "--names", nargs="+", default=[],
         help="Domain names to watch via TLS SNI and DNS (e.g. openai.com chatgpt.com)"
+    )
+    parser.add_argument(
+        "--all", action="store_true", dest="all_mode",
+        help="Capture and broadcast all TCP/UDP traffic without any filtering"
     )
     parser.add_argument(
         "--port", type=int, default=9000,
@@ -55,15 +59,19 @@ def parse_args():
         "--send-interval", type=int, default=1, dest="send_interval",
         help="ms between each queued event being sent to clients (default: 1)"
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.all_mode and not args.names:
+        parser.error("either --all or at least one --names value is required")
+    return args
 
 
 class Sniffer:
-    def __init__(self, names: list[str], broadcast_port: int, interface: str, send_interval: int):
+    def __init__(self, names: list[str], broadcast_port: int, interface: str, send_interval: int, all_mode: bool = False):
         self.names           = names
         self.broadcast_port  = broadcast_port
         self.interface       = interface
         self._send_interval  = send_interval  # ms between sends
+        self._all_mode       = all_mode
 
         # Shared structures — written by discovery threads, read by traffic thread.
         # Plain dict/set mutations are GIL-safe for this use case.
@@ -100,20 +108,28 @@ class Sniffer:
 
         asyncio.create_task(self._drain_loop())
 
-        # One discovery thread per flag name + one shared traffic thread
-        for name in self.names:
+        if self._all_mode:
+            # --all mode: single thread blasts every packet, no filtering
             threading.Thread(
-                target=self._discovery_thread,
-                args=(name,),
+                target=self._all_traffic_thread,
                 daemon=True,
-                name=f"discovery-{name}",
+                name="all-traffic",
             ).start()
+        else:
+            # Normal mode: one discovery thread per name + one filtered traffic thread
+            for name in self.names:
+                threading.Thread(
+                    target=self._discovery_thread,
+                    args=(name,),
+                    daemon=True,
+                    name=f"discovery-{name}",
+                ).start()
 
-        threading.Thread(
-            target=self._traffic_capture_thread,
-            daemon=True,
-            name="traffic",
-        ).start()
+            threading.Thread(
+                target=self._traffic_capture_thread,
+                daemon=True,
+                name="traffic",
+            ).start()
 
         async with server:
             await server.serve_forever()
@@ -348,6 +364,22 @@ class Sniffer:
         return ips
 
     # ------------------------------------------------------------------
+    # --all mode: blast every TCP/UDP packet with no IP filtering
+    # ------------------------------------------------------------------
+
+    def _all_traffic_thread(self):
+        print(f"[*] All-traffic capture : bpf=tcp or udp  (--all mode, no filtering)")
+        try:
+            capture = pyshark.LiveCapture(
+                interface=self.interface,
+                bpf_filter="tcp or udp",
+            )
+            for packet in capture.sniff_continuously():
+                self._broadcast(self._packet_info(packet, event_type="traffic"))
+        except Exception as exc:
+            print(f"[!] All-traffic capture error: {exc}")
+
+    # ------------------------------------------------------------------
     # Traffic monitor — single always-on capture
     # Uses a broad BPF filter; checks Python-side against known_ips.
     # No restarts needed: as known_ips grows the check automatically covers
@@ -399,12 +431,16 @@ def _now() -> str:
 
 def main():
     args = parse_args()
-    print(f"[*] Watching (SNI + DNS): {', '.join(args.names)}")
+    if args.all_mode:
+        print(f"[*] Mode: --all (broadcasting all TCP/UDP traffic)")
+    else:
+        print(f"[*] Watching (SNI + DNS): {', '.join(args.names)}")
     sniffer = Sniffer(
         names=args.names,
         broadcast_port=args.port,
         interface=args.interface,
         send_interval=args.send_interval,
+        all_mode=args.all_mode,
     )
     try:
         asyncio.run(sniffer.start())
