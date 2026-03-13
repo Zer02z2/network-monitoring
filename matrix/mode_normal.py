@@ -25,8 +25,9 @@ RECT_LIFETIME     = 100
 RECT_LIFETIME_VAR = 0.7
 RECT_ALPHA_MIN    = 0.22
 RECT_ALPHA_MAX    = 1
-RED_CHANCE        = 0.78
-STROKE_CHANCE     = 0.22
+RED_CHANCE             = 0.78
+DIRECTION_COLOR_BIAS   = 0.9  # probability of dominant color for directed packets
+STROKE_CHANCE          = 0.22
 
 Y_SPREAD          = 0.28
 Y_RANDOM_CHANCE   = 0.12
@@ -41,7 +42,6 @@ FLASH_MAX_COUNT   = 3
 
 NEON_RED   = (255,  15,  45)
 NEON_BLUE  = ( 20, 130, 255)
-NEON_CYAN  = (  2, 212, 240)
 NEON_WHITE = (255, 255, 255)
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -88,7 +88,10 @@ def spawn_burst(bytes_: int, direction, matrix_w: int, matrix_h: int, now: float
         x = int(random.random() * max(0, matrix_w - w))
         y = _pick_y(base_y, h, matrix_h)
         if color_mode == "CASCADE":
-            rgb = NEON_RED if direction == "outgoing" else NEON_CYAN
+            if direction == "outgoing":
+                rgb = NEON_RED if random.random() < DIRECTION_COLOR_BIAS else NEON_BLUE
+            else:
+                rgb = NEON_BLUE if random.random() < DIRECTION_COLOR_BIAS else NEON_RED
         else:
             rgb = NEON_RED if random.random() < RED_CHANCE else NEON_BLUE
         alpha = RECT_ALPHA_MIN + random.random() * (RECT_ALPHA_MAX - RECT_ALPHA_MIN)

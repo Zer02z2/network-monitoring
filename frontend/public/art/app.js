@@ -10,7 +10,8 @@ const RECT_LIFETIME = 100 // ms — base lifetime
 const RECT_LIFETIME_VAR = 0.7 // randomness factor on lifetime
 const RECT_ALPHA_MIN = 0.22 // starting alpha minimum
 const RECT_ALPHA_MAX = 0.75 // starting alpha maximum
-const RED_CHANCE = 0.78 // probability of neon red vs neon blue
+const RED_CHANCE = 0.9 // probability of neon red vs neon blue (undirected packets)
+const DIRECTION_COLOR_BIAS = 0.9 // probability of dominant color for directed packets (outgoing=red, incoming=blue)
 const STROKE_CHANCE = 0.22 // probability of outline-only rect
 
 const RECT_SPEED = 5000 // px/s — speed of the invisible sweep line across the screen
@@ -74,7 +75,14 @@ const spawnBurst = (bytes, direction) => {
         y: Math.max(0, Math.min(canvas.height - h, lineY)),
         w,
         h,
-        rgb: direction === "outgoing" ? NEON_RED : NEON_BLUE,
+        rgb:
+          direction === "outgoing"
+            ? Math.random() < DIRECTION_COLOR_BIAS
+              ? NEON_RED
+              : NEON_BLUE
+            : Math.random() < DIRECTION_COLOR_BIAS
+              ? NEON_BLUE
+              : NEON_RED,
         alpha:
           RECT_ALPHA_MIN + Math.random() * (RECT_ALPHA_MAX - RECT_ALPHA_MIN),
         spawnAt,
@@ -97,7 +105,14 @@ const spawnBurst = (bytes, direction) => {
         y: Math.random() * Math.max(0, canvas.height - h),
         w,
         h,
-        rgb: direction === "outgoing" ? NEON_RED : NEON_BLUE,
+        rgb:
+          direction === "outgoing"
+            ? Math.random() < DIRECTION_COLOR_BIAS
+              ? NEON_RED
+              : NEON_BLUE
+            : Math.random() < DIRECTION_COLOR_BIAS
+              ? NEON_BLUE
+              : NEON_RED,
         alpha:
           RECT_ALPHA_MIN + Math.random() * (RECT_ALPHA_MAX - RECT_ALPHA_MIN),
         spawnAt: now,
