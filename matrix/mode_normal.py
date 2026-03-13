@@ -93,7 +93,7 @@ def spawn_burst(bytes_: int, direction, matrix_w: int, matrix_h: int, now: float
             else:
                 rgb = NEON_BLUE if random.random() < DIRECTION_COLOR_BIAS else NEON_RED
         else:
-            rgb = NEON_RED if random.random() < RED_CHANCE else NEON_BLUE
+            rgb = NEON_RED if direction == "outgoing" else NEON_BLUE
         alpha = RECT_ALPHA_MIN + random.random() * (RECT_ALPHA_MAX - RECT_ALPHA_MIN)
         life  = RECT_LIFETIME * (1 - RECT_LIFETIME_VAR * 0.5 + random.random() * RECT_LIFETIME_VAR)
         _rects.append({

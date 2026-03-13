@@ -81,7 +81,7 @@ def spawn_burst(bytes_: int, direction, matrix_w: int, matrix_h: int, now: float
             _rects.append({
                 'x': int(random.random() * max(0, matrix_w - w)),
                 'y': y, 'w': w, 'h': h,
-                'rgb': (NEON_RED if random.random() < DIRECTION_COLOR_BIAS else NEON_BLUE) if (color_mode == "CASCADE" and direction == "outgoing") else (NEON_BLUE if random.random() < DIRECTION_COLOR_BIAS else NEON_RED) if color_mode == "CASCADE" else (NEON_RED if random.random() < RED_CHANCE else NEON_BLUE),
+                'rgb': (NEON_RED if random.random() < DIRECTION_COLOR_BIAS else NEON_BLUE) if (color_mode == "CASCADE" and direction == "outgoing") else (NEON_BLUE if random.random() < DIRECTION_COLOR_BIAS else NEON_RED) if color_mode == "CASCADE" else (NEON_RED if direction == "outgoing" else NEON_BLUE),
                 'alpha': RECT_ALPHA_MIN + random.random() * (RECT_ALPHA_MAX - RECT_ALPHA_MIN),
                 'spawn_at': spawn_at,
                 'created_at': spawn_at,
@@ -99,7 +99,7 @@ def spawn_burst(bytes_: int, direction, matrix_w: int, matrix_h: int, now: float
                 'x': int(random.random() * max(0, matrix_w - w)),
                 'y': int(random.random() * max(0, matrix_h - h)),
                 'w': w, 'h': h,
-                'rgb': (NEON_RED if random.random() < DIRECTION_COLOR_BIAS else NEON_BLUE) if (color_mode == "CASCADE" and direction == "outgoing") else (NEON_BLUE if random.random() < DIRECTION_COLOR_BIAS else NEON_RED) if color_mode == "CASCADE" else (NEON_RED if random.random() < RED_CHANCE else NEON_BLUE),
+                'rgb': (NEON_RED if random.random() < DIRECTION_COLOR_BIAS else NEON_BLUE) if (color_mode == "CASCADE" and direction == "outgoing") else (NEON_BLUE if random.random() < DIRECTION_COLOR_BIAS else NEON_RED) if color_mode == "CASCADE" else (NEON_RED if direction == "outgoing" else NEON_BLUE),
                 'alpha': RECT_ALPHA_MIN + random.random() * (RECT_ALPHA_MAX - RECT_ALPHA_MIN),
                 'spawn_at': now,
                 'created_at': now,
