@@ -77,9 +77,13 @@ def parse_args():
     parser.add_argument("--port", type=int, default=9001,
                         help="TCP port to listen on for tunnel connection (default: 9001)")
     parser.add_argument("--mode", choices=["NORMAL", "CASCADE"], default="NORMAL",
-                        help="Animation mode: NORMAL (stream-Y) or CASCADE (sweep-line) (default: NORMAL)")
+                        help="Animation mode:\n"
+                             "  NORMAL  — rects cluster around a drifting stream-Y position (default)\n"
+                             "  CASCADE — rects sweep top→bottom (incoming) or bottom→top (outgoing)")
     parser.add_argument("--color", choices=["NORMAL", "CASCADE"], default="NORMAL",
-                        help="Color mode: NORMAL (random red/blue) or CASCADE (outgoing=red, incoming=cyan) (default: NORMAL)")
+                        help="Color mode:\n"
+                             "  NORMAL  — outgoing=red, incoming=blue, pure (no mixing) (default)\n"
+                             "  CASCADE — outgoing=90%% red/10%% blue, incoming=90%% blue/10%% red")
 
     parser.add_argument("--led-rows",                type=int,  default=64)
     parser.add_argument("--led-cols",                type=int,  default=64)
@@ -91,6 +95,8 @@ def parse_args():
     parser.add_argument("--led-slowdown-gpio",       type=int,  default=3,   dest="led_slowdown_gpio")
     parser.add_argument("--led-brightness",          type=int,  default=100, dest="led_brightness")
     parser.add_argument("--led-hardware-mapping",    default="regular",      dest="led_hardware_mapping")
+    parser.add_argument("--led-pixel-mapper",        default="",             dest="led_pixel_mapper",
+                        help="Semicolon-separated pixel mappers (e.g. \"U-mapper\" or \"Rotate:180\")")
     parser.add_argument("--led-show-refresh",        action="store_true",    dest="led_show_refresh")
 
     return parser.parse_args()
@@ -118,6 +124,7 @@ def main():
     options.gpio_slowdown       = args.led_slowdown_gpio
     options.brightness          = args.led_brightness
     options.hardware_mapping    = args.led_hardware_mapping
+    options.pixel_mapper_config = args.led_pixel_mapper
     options.show_refresh_rate   = args.led_show_refresh
     options.drop_privileges     = False
 
