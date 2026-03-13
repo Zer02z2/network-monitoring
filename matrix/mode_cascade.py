@@ -30,8 +30,10 @@ RECT_ALPHA_MAX    = 0.75
 RED_CHANCE        = 0.78
 STROKE_CHANCE     = 0.22
 
-# px/s — speed of the invisible sweep line across the display height
-RECT_SPEED        = 5000
+# ms for the invisible sweep line to cross the full display height.
+# Fixed duration keeps the effect visually identical regardless of matrix size.
+# (On a 1080p browser canvas RECT_SPEED=5000 px/s → ~216 ms, hence this default.)
+SWEEP_DURATION_MS = 220
 
 FLASH_THRESHOLD   = 600
 FLASH_ALPHA_MIN   = 0.75
@@ -65,8 +67,7 @@ def spawn_burst(bytes_: int, direction, matrix_w: int, matrix_h: int, now: float
     max_h   = rect_min_h + scale_h * (rect_max_h - rect_min_h)
 
     if direction in ("incoming", "outgoing"):
-        # Total time for line to cross the full display height at RECT_SPEED px/s
-        sweep_ms = (matrix_h / RECT_SPEED) * 1000
+        sweep_ms = SWEEP_DURATION_MS
 
         for i in range(count):
             t        = (i / (count - 1)) if count > 1 else 0.0  # 0..1 across sweep
