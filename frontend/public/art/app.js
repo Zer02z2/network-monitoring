@@ -74,7 +74,7 @@ const spawnBurst = (bytes, direction) => {
         y: Math.max(0, Math.min(canvas.height - h, lineY)),
         w,
         h,
-        rgb: Math.random() < RED_CHANCE ? NEON_RED : NEON_BLUE,
+        rgb: direction === "outgoing" ? NEON_RED : NEON_BLUE,
         alpha:
           RECT_ALPHA_MIN + Math.random() * (RECT_ALPHA_MAX - RECT_ALPHA_MIN),
         spawnAt,
@@ -97,7 +97,7 @@ const spawnBurst = (bytes, direction) => {
         y: Math.random() * Math.max(0, canvas.height - h),
         w,
         h,
-        rgb: Math.random() < RED_CHANCE ? NEON_RED : NEON_BLUE,
+        rgb: direction === "outgoing" ? NEON_RED : NEON_BLUE,
         alpha:
           RECT_ALPHA_MIN + Math.random() * (RECT_ALPHA_MAX - RECT_ALPHA_MIN),
         spawnAt: now,

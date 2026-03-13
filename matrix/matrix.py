@@ -78,6 +78,8 @@ def parse_args():
                         help="TCP port to listen on for tunnel connection (default: 9001)")
     parser.add_argument("--mode", choices=["NORMAL", "CASCADE"], default="NORMAL",
                         help="Animation mode: NORMAL (stream-Y) or CASCADE (sweep-line) (default: NORMAL)")
+    parser.add_argument("--color", choices=["NORMAL", "CASCADE"], default="NORMAL",
+                        help="Color mode: NORMAL (random red/blue) or CASCADE (outgoing=red, incoming=cyan) (default: NORMAL)")
 
     parser.add_argument("--led-rows",                type=int,  default=64)
     parser.add_argument("--led-cols",                type=int,  default=64)
@@ -103,7 +105,7 @@ def main():
     else:
         import mode_normal as mode
 
-    print(f"[*] Mode: {args.mode}")
+    print(f"[*] Mode: {args.mode}  Color: {args.color}")
 
     options = RGBMatrixOptions()
     options.rows                = args.led_rows
@@ -144,7 +146,7 @@ def main():
             for _ in range(10):
                 try:
                     bytes_, direction = incoming.get_nowait()
-                    mode.spawn_burst(bytes_, direction, matrix_w, matrix_h, now)
+                    mode.spawn_burst(bytes_, direction, matrix_w, matrix_h, now, args.color)
                 except queue.Empty:
                     break
 
