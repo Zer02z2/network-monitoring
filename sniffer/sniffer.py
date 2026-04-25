@@ -368,14 +368,22 @@ class Sniffer:
     # ------------------------------------------------------------------
 
     def _all_traffic_thread(self):
-        print(f"[*] All-traffic capture : bpf=tcp or udp  (--all mode, no filtering)")
+        local_ip = _get_local_ip()
+        print(f"[*] All-traffic capture : bpf=tcp or udp  (--all mode, local IP: {local_ip})")
         try:
             capture = pyshark.LiveCapture(
                 interface=self.interface,
                 bpf_filter="tcp or udp",
             )
             for packet in capture.sniff_continuously():
-                self._broadcast(self._packet_info(packet, event_type="traffic"))
+                info = self._packet_info(packet, event_type="traffic")
+                src_ip = info.get("src_ip")
+                dst_ip = info.get("dst_ip")
+                if src_ip == local_ip:
+                    info["direction"] = "outgoing"
+                elif dst_ip == local_ip:
+                    info["direction"] = "incoming"
+                self._broadcast(info)
         except Exception as exc:
             print(f"[!] All-traffic capture error: {exc}")
 
